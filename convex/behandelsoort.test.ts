@@ -1,11 +1,17 @@
 import { ConvexError, type GenericId } from "convex/values";
 import { describe, expect, it } from "vitest";
 import {
+  BEHANDELSOORT_NAAM_MAX_LENGTH,
   type BehandelsoortDoc,
+  BehandelsoortNaamError,
   type BehandelsoortReader,
+  BehandelsoortReferencedError,
   InactiveBehandelsoortError,
   assertActiveBehandelsoort,
+  assertDeletable,
+  normalizeBehandelsoortNaam,
   toActiveOptions,
+  toAdminRows,
 } from "./behandelsoort";
 
 /**
@@ -87,5 +93,114 @@ describe("assertActiveBehandelsoort (BR-12 referential guard)", () => {
         error instanceof ConvexError &&
         (error as ConvexError<{ code: string }>).data.code === "inactive_behandelsoort",
     );
+  });
+});
+
+describe("toAdminRows (admin management projection)", () => {
+  it("includes both active and inactive entries (unlike the dropdown projection)", () => {
+    const rows = [bs("Sportmassage", true), bs("Oud", false)];
+    expect(toAdminRows(rows).map((r) => r.naam)).toEqual(["Sportmassage", "Oud"]);
+  });
+
+  it("keeps the actief flag on each row so the admin can see state", () => {
+    const [row] = toAdminRows([bs("Sportmassage", false)]);
+    expect(row.actief).toBe(false);
+    expect(Object.keys(row).sort()).toEqual(["_id", "actief", "naam"]);
+  });
+
+  it("lists active entries before inactive ones, each sorted by Dutch collation", () => {
+    const rows = [
+      bs("Zonnebank", true),
+      bs("Beëindigd", false),
+      bs("Acupunctuur", true),
+      bs("Afgevoerd", false),
+    ];
+    expect(toAdminRows(rows).map((r) => r.naam)).toEqual([
+      "Acupunctuur",
+      "Zonnebank",
+      "Afgevoerd",
+      "Beëindigd",
+    ]);
+  });
+
+  it("returns an empty list when there are no entries", () => {
+    expect(toAdminRows([])).toEqual([]);
+  });
+});
+
+describe("normalizeBehandelsoortNaam (admin create/rename validation)", () => {
+  it("trims surrounding whitespace and returns the canonical value", () => {
+    expect(normalizeBehandelsoortNaam("  Sportmassage  ")).toBe("Sportmassage");
+  });
+
+  it("accepts a normal vocabulary label unchanged", () => {
+    expect(normalizeBehandelsoortNaam("Klassieke massage")).toBe("Klassieke massage");
+  });
+
+  it("rejects an empty name (BehandelsoortNaamError 'empty')", () => {
+    expect(() => normalizeBehandelsoortNaam("   ")).toThrow(BehandelsoortNaamError);
+    try {
+      normalizeBehandelsoortNaam("");
+    } catch (error) {
+      expect((error as BehandelsoortNaamError).data).toEqual({
+        code: "invalid_naam",
+        reason: "empty",
+      });
+    }
+  });
+
+  it("rejects a name longer than the max length ('too_long')", () => {
+    const tooLong = "x".repeat(BEHANDELSOORT_NAAM_MAX_LENGTH + 1);
+    try {
+      normalizeBehandelsoortNaam(tooLong);
+      throw new Error("expected normalizeBehandelsoortNaam to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(BehandelsoortNaamError);
+      expect((error as BehandelsoortNaamError).data).toEqual({
+        code: "invalid_naam",
+        reason: "too_long",
+      });
+    }
+  });
+
+  it("accepts a name exactly at the max length", () => {
+    const atLimit = "x".repeat(BEHANDELSOORT_NAAM_MAX_LENGTH);
+    expect(normalizeBehandelsoortNaam(atLimit)).toBe(atLimit);
+  });
+});
+
+describe("assertDeletable (A-27 referential integrity)", () => {
+  it("permits deletion when nothing references the entry", () => {
+    expect(() => assertDeletable({ afspraken: 0, behandelingen: 0 })).not.toThrow();
+  });
+
+  it("blocks deletion when an afspraak references the entry", () => {
+    expect(() => assertDeletable({ afspraken: 1, behandelingen: 0 })).toThrow(
+      BehandelsoortReferencedError,
+    );
+  });
+
+  it("blocks deletion when a behandeling references the entry", () => {
+    expect(() => assertDeletable({ afspraken: 0, behandelingen: 1 })).toThrow(
+      BehandelsoortReferencedError,
+    );
+  });
+
+  it("blocks deletion when both an afspraak and a behandeling reference the entry", () => {
+    expect(() => assertDeletable({ afspraken: 3, behandelingen: 2 })).toThrow(
+      BehandelsoortReferencedError,
+    );
+  });
+
+  it("throws a structured ConvexError carrying a non-identifying code (A-27)", () => {
+    try {
+      assertDeletable({ afspraken: 1, behandelingen: 0 });
+      throw new Error("expected assertDeletable to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConvexError);
+      expect((error as ConvexError<{ code: string }>).data).toEqual({
+        code: "behandelsoort_referenced",
+      });
+    }
   });
 });
