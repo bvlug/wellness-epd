@@ -21,3 +21,20 @@ export const PUBLIC_ROUTE_PATTERNS = [
   "/sign-up",
   "/sign-up/(.*)",
 ] as const;
+
+/**
+ * Patiëntbeheer route helpers — a single source of truth for the patient pages
+ * so navigation and redirects never hardcode path strings. All of these are
+ * protected (not in {@link PUBLIC_ROUTE_PATTERNS}), so the Clerk middleware
+ * gates them.
+ */
+export const PATIENT_ROUTES = {
+  /** The "New patient" form (Story P-1-S1). */
+  new: "/patienten/nieuw",
+  /**
+   * A patient's profile page (Story P-1-S2 / #20). Built here only as a minimal
+   * placeholder that the create flow can redirect to on success; #20 fleshes it
+   * out into the real profile view.
+   */
+  profile: (patientId: string): string => `/patienten/${patientId}`,
+} as const;
