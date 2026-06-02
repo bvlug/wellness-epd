@@ -1,5 +1,6 @@
 import { mutationGeneric } from "convex/server";
 import { ConvexError, v } from "convex/values";
+import { normalizeBsn } from "../lib/bsn";
 import {
   type PatientInput,
   type ValidationError,
@@ -87,9 +88,13 @@ function optionalTrimmed(value: string | undefined): string | undefined {
 /**
  * Pure mapping from validated input to the document we insert. ASSUMES the
  * input already passed {@link validatePatientInput}; it normalizes/trims the
- * stored values (the BSN is reduced to its canonical nine-digit form upstream
- * by the validator's Elfproef, but we re-trim defensively here). Extracted so
- * the field mapping is unit-testable without a Convex runtime.
+ * stored values. The BSN is stored in its CANONICAL nine-digit form via
+ * {@link normalizeBsn} — never the raw entry — so that the persisted value and
+ * the `by_bsn` duplicate lookup are always comparing the same canonical string
+ * (a BSN typed without a leading zero must collide with the stored zero-padded
+ * one; EH-4). Validation guarantees `normalizeBsn` succeeds here; the `?? trim`
+ * is a defensive fallback that never runs for validated input. Extracted so the
+ * field mapping is unit-testable without a Convex runtime.
  */
 export function buildPatientDocument(input: PatientInput): PatientDocument {
   return {
@@ -99,7 +104,7 @@ export function buildPatientDocument(input: PatientInput): PatientDocument {
     geboortedatum: input.geboortedatum.trim(),
     // Safe: validation guarantees one of GESLACHT_VALUES.
     geslacht: input.geslacht.trim() as (typeof GESLACHT_VALUES)[number],
-    bsn: input.bsn.trim(),
+    bsn: normalizeBsn(input.bsn) ?? input.bsn.trim(),
     email: optionalTrimmed(input.email),
     telefoonnummer: optionalTrimmed(input.telefoonnummer),
     notities: optionalTrimmed(input.notities),

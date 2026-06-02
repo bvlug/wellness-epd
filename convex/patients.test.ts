@@ -52,6 +52,15 @@ describe("buildPatientDocument", () => {
     const doc = buildPatientDocument(validInput({ tussenvoegsel: "  van  " }));
     expect(doc.tussenvoegsel).toBe("van");
   });
+
+  it("stores the BSN in canonical zero-padded form so duplicate lookups match (EH-4)", () => {
+    // A BSN typed without its leading zero must be stored zero-padded, so the
+    // by_bsn index lookup collides with an already-stored padded value.
+    // "10000008" is a synthetic 8-digit value whose canonical form "010000008"
+    // passes the Elfproef (AVG/GDPR, BR-11).
+    const doc = buildPatientDocument(validInput({ bsn: "10000008" }));
+    expect(doc.bsn).toBe("010000008");
+  });
 });
 
 describe("canOverrideDuplicate (A-25)", () => {
