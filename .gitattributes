@@ -1,0 +1,26 @@
+# Normalize line endings: the repo stores LF and checks out LF on every OS.
+# Prevents Windows autocrlf from rewriting files to CRLF (which breaks Biome).
+* text=auto eol=lf
+
+# Explicit LF for source and config we lint/format with Biome.
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+
+# Binary files: never touch their bytes.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.svg  text eol=lf
+*.ico  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
