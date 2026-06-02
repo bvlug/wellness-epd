@@ -250,6 +250,291 @@ export const createPatient = mutationGeneric({
 });
 
 /* -------------------------------------------------------------------------- */
+/* Edit patient record (Story P-1-S3; FR-2, BR-1, BR-2, BR-11, EH-4, AC-2,    */
+/* AC-9, A-9, A-25).                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Patient edit (Story P-1-S3). The AUTHORITATIVE update path: like
+ * {@link createPatient}, every rule is enforced here on the server regardless of
+ * the form. The flow, strictly in order:
+ *
+ *   1. Authorize the caller: `balie` OR `admin` may edit (FR-2); a
+ *      `behandelaar`-only caller is denied BEFORE any data access (AC-2), via the
+ *      shared {@link assertHasRole} guard reusing {@link CREATE_ROLES}.
+ *   2. Load the existing patient (the edit target). A missing record throws a
+ *      PII-free `patient_not_found` error.
+ *   3. **Partial update (A-9):** only the SUBMITTED fields change. Unsubmitted
+ *      fields keep their stored value. The submitted patch is merged over the
+ *      stored record into a complete {@link PatientInput}, which is then
+ *      re-validated with the SAME pure {@link validatePatientInput} the create
+ *      path uses (BR-1, BR-2) — so editing the BSN to an invalid value is
+ *      rejected, never echoing the value (BR-11).
+ *   4. **Duplicate-BSN on edit (EH-4, A-25):** if the BSN changed and another
+ *      ACTIVE patient already holds the new canonical BSN, block with a warning.
+ *      The patient's OWN record is excluded from the check. Overriding requires
+ *      an explicit `acknowledgeDuplicate: true` AND the `admin` role — a balie
+ *      cannot override (mirrors create exactly).
+ *   5. Patch the patient, then write a PII-free `edit` audit entry in the SAME
+ *      transaction (AC-9, BR-13).
+ *
+ * **AVG/GDPR (BR-11).** As with create, no code path here logs, prints, or throws
+ * the BSN value: validation errors carry a field + code only and the duplicate
+ * error names no value. {@link logAudit} is structurally incapable of PII.
+ */
+
+/** Roles permitted to edit a patient (FR-2). Identical to the create gate. */
+const EDIT_ROLES: readonly Role[] = CREATE_ROLES;
+
+/**
+ * Structured, PII-free application error for a failed edit. Modeled (like
+ * {@link PatientCreationError}) as a {@link ConvexError} so the form can branch on
+ * `code` without the value ever appearing in the payload (BR-11). Adds a
+ * `not_found` code for the case where the edit target no longer exists.
+ */
+export type PatientUpdateErrorData =
+  | { code: "validation_failed"; errors: ValidationError[] }
+  | { code: "duplicate_bsn"; canOverride: boolean }
+  | { code: "patient_not_found" };
+
+export class PatientUpdateError extends ConvexError<PatientUpdateErrorData> {
+  constructor(data: PatientUpdateErrorData) {
+    super(data);
+    this.name = "PatientUpdateError";
+  }
+}
+
+/**
+ * The submitted edit patch: every editable field is optional. An ABSENT field
+ * (`undefined`) means "leave untouched" (A-9); a PRESENT field — including an
+ * empty string for an optional contact field — is an intentional change. This
+ * distinction is the whole of the partial-update contract, so it is modeled in
+ * the type rather than inferred.
+ */
+export interface PatientUpdateInput {
+  voornaam?: string;
+  tussenvoegsel?: string;
+  achternaam?: string;
+  geboortedatum?: string;
+  geslacht?: string;
+  bsn?: string;
+  email?: string;
+  telefoonnummer?: string;
+  notities?: string;
+}
+
+/**
+ * The stored fields the edit core reads to (a) reconstruct the full input for
+ * re-validation and (b) know the current BSN so it can skip the duplicate check
+ * when the BSN is unchanged. Mirrors the persisted {@link PatientDocument} minus
+ * the always-true `actief` literal.
+ */
+export interface ExistingPatient {
+  voornaam: string;
+  tussenvoegsel?: string;
+  achternaam: string;
+  geboortedatum: string;
+  geslacht: (typeof GESLACHT_VALUES)[number];
+  bsn: string;
+  email?: string;
+  telefoonnummer?: string;
+  notities?: string;
+}
+
+/**
+ * The patch we hand to `db.patch`: only the fields the document map should
+ * change. Optional fields can be set to `undefined` to clear a stored value
+ * (Convex treats an explicit `undefined` patch as field removal).
+ */
+export type PatientPatch = Partial<PatientDocument>;
+
+/**
+ * Reconstruct the COMPLETE {@link PatientInput} that re-validation runs against,
+ * by overlaying the submitted patch onto the stored record (A-9). A field absent
+ * from the patch contributes its stored value, so validation sees the record as
+ * it WOULD be after the edit — e.g. an untouched BSN is re-checked as still
+ * valid, and a touched-but-blanked required field correctly fails `required`.
+ * Pure and unit-testable.
+ */
+export function mergePatientInput(
+  existing: ExistingPatient,
+  patch: PatientUpdateInput,
+): PatientInput {
+  return {
+    voornaam: patch.voornaam ?? existing.voornaam,
+    tussenvoegsel: patch.tussenvoegsel ?? existing.tussenvoegsel,
+    achternaam: patch.achternaam ?? existing.achternaam,
+    geboortedatum: patch.geboortedatum ?? existing.geboortedatum,
+    geslacht: patch.geslacht ?? existing.geslacht,
+    bsn: patch.bsn ?? existing.bsn,
+    email: patch.email ?? existing.email,
+    telefoonnummer: patch.telefoonnummer ?? existing.telefoonnummer,
+    notities: patch.notities ?? existing.notities,
+  };
+}
+
+/**
+ * Build the field-level patch to persist from the already-validated, fully
+ * merged input. We patch the WHOLE editable field set (not just changed fields):
+ * the merged input already equals stored-plus-changes, so re-writing every field
+ * is idempotent for untouched ones and avoids tracking a per-field dirty set.
+ * Optional contact fields are trimmed-or-cleared via {@link optionalTrimmed} so a
+ * blanked field becomes `undefined` (cleared) rather than an empty string,
+ * exactly like create. The BSN is stored in canonical form (EH-4 parity).
+ */
+export function buildPatientPatch(input: PatientInput): PatientPatch {
+  return {
+    voornaam: input.voornaam.trim(),
+    tussenvoegsel: optionalTrimmed(input.tussenvoegsel),
+    achternaam: input.achternaam.trim(),
+    geboortedatum: input.geboortedatum.trim(),
+    geslacht: input.geslacht.trim() as (typeof GESLACHT_VALUES)[number],
+    bsn: normalizeBsn(input.bsn) ?? input.bsn.trim(),
+    email: optionalTrimmed(input.email),
+    telefoonnummer: optionalTrimmed(input.telefoonnummer),
+    notities: optionalTrimmed(input.notities),
+  };
+}
+
+/**
+ * Lister for the edit duplicate check: returns whether any ACTIVE patient OTHER
+ * THAN `selfId` already holds the given canonical BSN. The self-exclusion is the
+ * key difference from create — a patient may always keep its own BSN.
+ */
+type ActiveBsnExistsExcluding = (bsn: string, selfId: string) => Promise<boolean>;
+
+/**
+ * Core edit decision, decoupled from Convex (mirrors {@link resolvePatientCreation}).
+ * Merges the patch over the stored record, validates the result, runs the
+ * self-excluding duplicate gate ONLY when the BSN actually changed, and returns
+ * the {@link PatientPatch} to persist — or throws a {@link PatientUpdateError}.
+ *
+ * The duplicate check is skipped when the canonical BSN is unchanged, so saving
+ * an edit that does not touch the BSN never trips the patient's own record as a
+ * "duplicate". `acknowledgeDuplicate` is honored ONLY for admins (A-25).
+ */
+export async function resolvePatientUpdate(args: {
+  patientId: string;
+  existing: ExistingPatient;
+  patch: PatientUpdateInput;
+  roles: readonly Role[];
+  acknowledgeDuplicate: boolean;
+  activeBsnExistsExcluding: ActiveBsnExistsExcluding;
+  now?: Date;
+}): Promise<PatientPatch> {
+  const mergedInput = mergePatientInput(args.existing, args.patch);
+
+  const validationErrors = validatePatientInput(mergedInput, args.now);
+  if (validationErrors.length > 0) {
+    throw new PatientUpdateError({ code: "validation_failed", errors: validationErrors });
+  }
+
+  const patch = buildPatientPatch(mergedInput);
+
+  // Only the canonical BSN matters for the duplicate gate; compare canonical
+  // forms so a cosmetic reformat (e.g. leading-zero) of the SAME number is not
+  // treated as a change that needs a duplicate lookup.
+  const newBsn = patch.bsn as string;
+  const currentBsn = normalizeBsn(args.existing.bsn) ?? args.existing.bsn;
+  if (newBsn !== currentBsn) {
+    const duplicate = await args.activeBsnExistsExcluding(newBsn, args.patientId);
+    if (duplicate && !canOverrideDuplicate(args.roles, args.acknowledgeDuplicate)) {
+      // BR-11: no BSN value in the payload — only the fact + override capability.
+      throw new PatientUpdateError({
+        code: "duplicate_bsn",
+        canOverride: args.roles.includes(DUPLICATE_OVERRIDE_ROLE),
+      });
+    }
+  }
+
+  return patch;
+}
+
+/**
+ * Convex `db` slice the edit mutation needs: a `get` by patient id, the indexed
+ * `by_bsn` query (for the self-excluding duplicate check), and a `patch`. Plus
+ * the audit insert via {@link AuditMutationContext}.
+ */
+interface PatientUpdateContext extends AuthContext, AuditMutationContext {
+  db: AuditMutationContext["db"] & {
+    get: (id: GenericId<"patient">) => Promise<(ExistingPatient & { _id: string }) | null>;
+    patch: (id: GenericId<"patient">, patch: PatientPatch) => Promise<void>;
+    query: (table: "patient") => {
+      withIndex: (
+        index: "by_bsn",
+        range: (q: { eq: (field: "bsn", value: string) => unknown }) => unknown,
+      ) => { collect: () => Promise<Array<{ _id: string; actief: boolean }>> };
+    };
+  };
+}
+
+export const updatePatient = mutationGeneric({
+  args: {
+    patientId: v.id("patient"),
+    voornaam: v.optional(v.string()),
+    tussenvoegsel: v.optional(v.string()),
+    achternaam: v.optional(v.string()),
+    geboortedatum: v.optional(v.string()),
+    geslacht: v.optional(geslachtValidator),
+    bsn: v.optional(v.string()),
+    email: v.optional(v.string()),
+    telefoonnummer: v.optional(v.string()),
+    notities: v.optional(v.string()),
+    acknowledgeDuplicate: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    // 1. Authorize: balie OR admin only (FR-2, AC-2). Denies before any read.
+    const identity = await assertHasRole(ctx as AuthContext, EDIT_ROLES);
+    const roles = getRoles(identity);
+
+    const mutationCtx = ctx as unknown as PatientUpdateContext;
+
+    // 2. Load the edit target.
+    const existing = await mutationCtx.db.get(args.patientId);
+    if (existing === null) {
+      throw new PatientUpdateError({ code: "patient_not_found" });
+    }
+
+    // 3-4. Merge + validate + self-excluding duplicate gate (pure core).
+    const patch = await resolvePatientUpdate({
+      patientId: args.patientId,
+      existing,
+      patch: {
+        voornaam: args.voornaam,
+        tussenvoegsel: args.tussenvoegsel,
+        achternaam: args.achternaam,
+        geboortedatum: args.geboortedatum,
+        geslacht: args.geslacht,
+        bsn: args.bsn,
+        email: args.email,
+        telefoonnummer: args.telefoonnummer,
+        notities: args.notities,
+      },
+      roles,
+      acknowledgeDuplicate: args.acknowledgeDuplicate ?? false,
+      activeBsnExistsExcluding: async (bsn, selfId) => {
+        const matches = await mutationCtx.db
+          .query("patient")
+          .withIndex("by_bsn", (q) => q.eq("bsn", bsn))
+          .collect();
+        return matches.some((patient) => patient.actief && patient._id !== selfId);
+      },
+    });
+
+    // 5. Persist the patch, then the PII-free `edit` audit entry, same tx (AC-9).
+    await mutationCtx.db.patch(args.patientId, patch);
+
+    await logAudit(mutationCtx, {
+      action: "edit",
+      resourceType: "patient",
+      resourceId: args.patientId,
+    });
+
+    return { patientId: args.patientId };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /* Patient search (Story P-2-S1; FR-4, BR-4, BR-11, EH-1, A-10, AC-9).        */
 /* -------------------------------------------------------------------------- */
 

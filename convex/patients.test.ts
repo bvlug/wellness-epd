@@ -3,16 +3,21 @@ import { describe, expect, it } from "vitest";
 import type { PatientInput } from "../lib/patient-validation";
 import type { Role } from "./auth";
 import {
+  type ExistingPatient,
   PatientCreationError,
+  PatientUpdateError,
   SEARCH_RESULT_LIMIT,
   type SearchablePatient,
   buildPatientDocument,
+  buildPatientPatch,
   canOverrideDuplicate,
   hasUsableCriteria,
   matchesCriteria,
+  mergePatientInput,
   normalizeSearchCriteria,
   resolvePatientCreation,
   resolvePatientSearch,
+  resolvePatientUpdate,
 } from "./patients";
 
 /**
@@ -403,3 +408,285 @@ describe("resolvePatientSearch — BSN leading-zero parity end-to-end", () => {
     expect(results).toHaveLength(1);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Edit patient core (Story P-1-S3; FR-2, BR-1, BR-2, BR-11, EH-4, A-9, A-25).*/
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Tests for the pure patient-EDIT core the `updatePatient` Convex mutation wires
+ * up: partial merge (A-9), re-validation (BR-1/BR-2), the self-EXCLUDING active
+ * duplicate gate (EH-4), and the admin-only acknowledge override (A-25). No
+ * Convex runtime (the live deploy is verified manually). All data is SYNTHETIC
+ * (AVG/GDPR, BR-11): "123456782" is the FRD's documented synthetic example BSN;
+ * "111222333" is a second synthetic value that also passes the Elfproef.
+ */
+
+const SELF_ID = "patient_self";
+
+function existing(overrides: Partial<ExistingPatient> = {}): ExistingPatient {
+  return {
+    voornaam: "Testvoornaam",
+    achternaam: "Testachternaam",
+    geboortedatum: "1990-01-01",
+    geslacht: "man",
+    bsn: "123456782",
+    email: "oud@example.test",
+    telefoonnummer: "0600000000",
+    ...overrides,
+  };
+}
+
+/** No OTHER active patient holds the BSN. */
+const noOtherDuplicate = () => Promise.resolve(false);
+/** Another active patient holds the BSN. */
+const otherHasDuplicate = () => Promise.resolve(true);
+
+describe("mergePatientInput — partial update (A-9)", () => {
+  it("keeps unsubmitted fields at their stored value", () => {
+    const input = mergePatientInput(existing(), { telefoonnummer: "0611111111" });
+    expect(input.telefoonnummer).toBe("0611111111");
+    // Everything else untouched.
+    expect(input.voornaam).toBe("Testvoornaam");
+    expect(input.email).toBe("oud@example.test");
+    expect(input.bsn).toBe("123456782");
+  });
+
+  it("treats an explicit empty string as an intentional clear, not 'untouched'", () => {
+    const input = mergePatientInput(existing(), { email: "" });
+    expect(input.email).toBe("");
+  });
+
+  it("with an empty patch reproduces the stored record exactly", () => {
+    const input = mergePatientInput(existing(), {});
+    expect(input).toMatchObject({
+      voornaam: "Testvoornaam",
+      achternaam: "Testachternaam",
+      bsn: "123456782",
+      email: "oud@example.test",
+    });
+  });
+});
+
+describe("buildPatientPatch", () => {
+  it("clears a blanked optional field (empty string -> undefined), not store ''", () => {
+    const patch = buildPatientPatch(mergePatientInput(existing(), { email: "  " }));
+    expect(patch.email).toBeUndefined();
+  });
+
+  it("stores the BSN in canonical zero-padded form (EH-4 parity)", () => {
+    const patch = buildPatientPatch(mergePatientInput(existing(), { bsn: "10000008" }));
+    expect(patch.bsn).toBe("010000008");
+  });
+
+  it("does not include the always-true actief literal (edit must not flip it)", () => {
+    const patch = buildPatientPatch(mergePatientInput(existing(), {}));
+    expect(patch).not.toHaveProperty("actief");
+  });
+});
+
+describe("resolvePatientUpdate — successful edit + partial update (A-9)", () => {
+  it("returns a patch for a single changed field, leaving others as stored", async () => {
+    const patch = await resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing(),
+      patch: { telefoonnummer: "0612345678" },
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: noOtherDuplicate,
+      now: NOW,
+    });
+    expect(patch.telefoonnummer).toBe("0612345678");
+    expect(patch.voornaam).toBe("Testvoornaam");
+    expect(patch.bsn).toBe("123456782");
+  });
+
+  it("does NOT run the duplicate check when the BSN is unchanged", async () => {
+    let queried = false;
+    const spy = () => {
+      queried = true;
+      return Promise.resolve(true);
+    };
+    await resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing(),
+      // Only the email changes; BSN identical to stored.
+      patch: { email: "nieuw@example.test" },
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: spy,
+      now: NOW,
+    });
+    expect(queried).toBe(false);
+  });
+
+  it("does NOT flag the patient's OWN unchanged BSN as a duplicate", async () => {
+    // Even submitting the same BSN (cosmetically) must not trip the gate.
+    const patch = await resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing({ bsn: "123456782" }),
+      patch: { bsn: "123456782" },
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: otherHasDuplicate, // would block if consulted
+      now: NOW,
+    });
+    expect(patch.bsn).toBe("123456782");
+  });
+});
+
+describe("resolvePatientUpdate — BSN re-validation (BR-2, BR-11)", () => {
+  it("rejects editing the BSN to an invalid value, never echoing it", async () => {
+    const promise = resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing(),
+      patch: { bsn: "123456789" }, // fails Elfproef
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: noOtherDuplicate,
+      now: NOW,
+    });
+    await expect(promise).rejects.toBeInstanceOf(PatientUpdateError);
+    await expect(promise).rejects.toMatchObject({ data: { code: "validation_failed" } });
+    await expect(promise).rejects.toSatisfy((error: PatientUpdateError) => {
+      return !JSON.stringify(error.data).includes("123456789");
+    });
+  });
+
+  it("rejects blanking a required field via the edit", async () => {
+    await expect(
+      resolvePatientUpdate({
+        patientId: SELF_ID,
+        existing: existing(),
+        patch: { voornaam: "" },
+        roles: ["balie"],
+        acknowledgeDuplicate: false,
+        activeBsnExistsExcluding: noOtherDuplicate,
+        now: NOW,
+      }),
+    ).rejects.toMatchObject({ data: { code: "validation_failed" } });
+  });
+
+  it("does NOT run the duplicate check if validation already failed", async () => {
+    let queried = false;
+    const spy = () => {
+      queried = true;
+      return Promise.resolve(true);
+    };
+    await expect(
+      resolvePatientUpdate({
+        patientId: SELF_ID,
+        existing: existing(),
+        patch: { bsn: "123456789" },
+        roles: ["balie"],
+        acknowledgeDuplicate: false,
+        activeBsnExistsExcluding: spy,
+        now: NOW,
+      }),
+    ).rejects.toBeInstanceOf(PatientUpdateError);
+    expect(queried).toBe(false);
+  });
+});
+
+describe("resolvePatientUpdate — duplicate-BSN on edit (EH-4, A-25)", () => {
+  it("blocks a balie when ANOTHER active patient holds the new BSN (canOverride=false)", async () => {
+    const promise = resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing({ bsn: "123456782" }),
+      patch: { bsn: "111222333" }, // a different, valid synthetic BSN
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: otherHasDuplicate,
+      now: NOW,
+    });
+    await expect(promise).rejects.toMatchObject({
+      data: { code: "duplicate_bsn", canOverride: false },
+    });
+  });
+
+  it("blocks even a balie who acknowledges (only an admin may override)", async () => {
+    await expect(
+      resolvePatientUpdate({
+        patientId: SELF_ID,
+        existing: existing({ bsn: "123456782" }),
+        patch: { bsn: "111222333" },
+        roles: ["balie"],
+        acknowledgeDuplicate: true,
+        activeBsnExistsExcluding: otherHasDuplicate,
+        now: NOW,
+      }),
+    ).rejects.toMatchObject({ data: { code: "duplicate_bsn" } });
+  });
+
+  it("tells an admin (without acknowledgement) that they CAN override", async () => {
+    await expect(
+      resolvePatientUpdate({
+        patientId: SELF_ID,
+        existing: existing({ bsn: "123456782" }),
+        patch: { bsn: "111222333" },
+        roles: ["admin"],
+        acknowledgeDuplicate: false,
+        activeBsnExistsExcluding: otherHasDuplicate,
+        now: NOW,
+      }),
+    ).rejects.toMatchObject({ data: { code: "duplicate_bsn", canOverride: true } });
+  });
+
+  it("lets an admin save through a duplicate WITH an explicit acknowledgement (A-25)", async () => {
+    const patch = await resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing({ bsn: "123456782" }),
+      patch: { bsn: "111222333" },
+      roles: ["admin"],
+      acknowledgeDuplicate: true,
+      activeBsnExistsExcluding: otherHasDuplicate,
+      now: NOW,
+    });
+    expect(patch.bsn).toBe("111222333");
+  });
+
+  it("never carries the BSN value in the duplicate error payload (BR-11)", async () => {
+    const promise = resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing({ bsn: "123456782" }),
+      patch: { bsn: "111222333" },
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: otherHasDuplicate,
+      now: NOW,
+    });
+    await expect(promise).rejects.toSatisfy((error: PatientUpdateError) => {
+      return !JSON.stringify(error.data).includes("111222333");
+    });
+  });
+
+  it("passes the patient's own id to the lister so it can self-exclude", async () => {
+    let seenSelfId: string | null = null;
+    await resolvePatientUpdate({
+      patientId: SELF_ID,
+      existing: existing({ bsn: "123456782" }),
+      patch: { bsn: "111222333" },
+      roles: ["balie"],
+      acknowledgeDuplicate: false,
+      activeBsnExistsExcluding: (_bsn, selfId) => {
+        seenSelfId = selfId;
+        return Promise.resolve(false);
+      },
+      now: NOW,
+    });
+    expect(seenSelfId).toBe(SELF_ID);
+  });
+});
+
+describe("PatientUpdateError", () => {
+  it("is a ConvexError so Convex surfaces it as client data, not a 500", () => {
+    const error = new PatientUpdateError({ code: "patient_not_found" });
+    expect(error).toBeInstanceOf(ConvexError);
+  });
+});
+
+// Type-only assertion: the edit-permitted roles are exactly balie + admin
+// (FR-2); behandelaar is absent, so updatePatient's assertHasRole denies it
+// (AC-2). The runtime denial path is covered by auth.test.ts (assertHasRole).
+const _editRoles: readonly Role[] = ["balie", "admin"];
+void _editRoles;
