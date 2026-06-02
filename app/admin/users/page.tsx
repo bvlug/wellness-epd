@@ -102,6 +102,11 @@ export default function AdminUsersPage() {
     }
   }, [ready, isAdmin, refresh]);
 
+  // Single-admin assumption (POC): the role model is a read-modify-write on
+  // Clerk metadata, so two admins toggling the same user's roles concurrently
+  // would be last-write-wins. Accepted for this POC — admin actions are rare and
+  // single-operator; revisit (optimistic concurrency / server-side merge) before
+  // multi-admin production use.
   const toggleRole = useCallback(
     async (user: StaffUser, role: Role, hasRole: boolean) => {
       const key = `${user.id}:${role}`;

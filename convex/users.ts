@@ -3,7 +3,7 @@
 import { type ClerkClient, type User, createClerkClient } from "@clerk/backend";
 import { actionGeneric } from "convex/server";
 import { ConvexError, v } from "convex/values";
-import { ROLES, type Role, assertHasRole } from "./auth";
+import { type AuthContext, ROLES, type Role, assertHasRole } from "./auth";
 import { parseRoles, withRole, withoutRole } from "./userRoles";
 
 /**
@@ -60,9 +60,22 @@ class ClerkNotConfiguredError extends ConvexError<{ code: "clerk_not_configured"
 }
 
 /**
+ * A factory that lazily produces a Clerk backend client. The actions below take
+ * one of these rather than reading `process.env` inline, which gives two things:
+ *   1. Production reads the secret from the Convex env at call time (see
+ *      {@link clerk}), never at import time, so a missing secret fails closed
+ *      with a structured error.
+ *   2. Tests can inject a factory returning a MOCK client — and, crucially, can
+ *      assert the factory is only ever invoked AFTER authorization passes, so an
+ *      unauthorized caller never reaches the Clerk network layer (AC-4).
+ */
+export type ClerkClientFactory = () => ClerkClient;
+
+/**
  * Build a Clerk backend client from the Convex env secret. Fails closed with a
  * structured error if the secret is missing rather than letting the SDK throw an
- * unstructured one.
+ * unstructured one. This is the production factory; it is the only place the
+ * secret is read, and the value is never logged or returned to the client.
  */
 function clerk(): ClerkClient {
   const secretKey = process.env.CLERK_SECRET_KEY;
@@ -91,45 +104,119 @@ function toStaffUser(user: User): StaffUser {
 const roleValidator = v.union(...ROLES.map((role) => v.literal(role)));
 
 /**
- * List all Clerk users with their current EPD role(s). Admin only.
+ * Core logic of {@link listUsers}, decoupled from the Convex `action` wrapper and
+ * from the production secret so it is unit-testable with a mocked Clerk client.
+ *
+ * SECURITY ORDERING (AC-4): `assertHasRole` runs FIRST and `getClerk` is only
+ * invoked once authorization has passed. An unauthenticated or non-admin caller
+ * therefore never causes a Clerk client to be built or a Clerk API call to be
+ * made — the tests assert exactly this by passing a factory that records whether
+ * it was called.
  *
  * Pages through the entire Clerk user directory so the screen shows everyone,
  * not just the first page. Returns only id / display name / primary email /
  * roles — no Clerk tokens, password hashes, or other sensitive fields.
  */
+export async function listUsersHandler(
+  ctx: AuthContext,
+  getClerk: ClerkClientFactory,
+): Promise<StaffUser[]> {
+  await assertHasRole(ctx, ["admin"]);
+  const client = getClerk();
+
+  const users: StaffUser[] = [];
+  for (let offset = 0; ; offset += CLERK_PAGE_SIZE) {
+    const page = await client.users.getUserList({
+      limit: CLERK_PAGE_SIZE,
+      offset,
+      orderBy: "+created_at",
+    });
+    for (const user of page.data) {
+      users.push(toStaffUser(user));
+    }
+    // `totalCount` is the full directory size; stop once we've collected it.
+    if (users.length >= page.totalCount || page.data.length === 0) {
+      break;
+    }
+  }
+  return users;
+}
+
+/**
+ * Core logic of {@link assignRole}/{@link removeRole}: the shared read-modify-write
+ * against a single Clerk user's `public_metadata.roles`, parameterized by the
+ * pure role-set transform to apply. Decoupled from the `action` wrapper and the
+ * production secret so it is unit-testable with a mocked Clerk client.
+ *
+ * SECURITY ORDERING (AC-4): `assertHasRole` runs FIRST; `getClerk` is only
+ * invoked after authorization passes, so an unauthorized caller never reaches
+ * the Clerk network layer.
+ *
+ * Writes back only the `roles` key via `updateUserMetadata`, which performs a
+ * shallow merge of top-level `publicMetadata` keys on Clerk's side — so any
+ * OTHER public metadata the user carries (e.g. an unrelated `somethingElse`
+ * key) is preserved untouched. We deliberately send just `{ roles: next }`
+ * rather than re-sending the whole blob, relying on that documented merge.
+ */
+async function updateUserRoleHandler(
+  ctx: AuthContext,
+  getClerk: ClerkClientFactory,
+  userId: string,
+  transform: (current: Role[]) => Role[],
+): Promise<StaffUser> {
+  await assertHasRole(ctx, ["admin"]);
+  const client = getClerk();
+
+  const user = await client.users.getUser(userId);
+  const current = parseRoles(user.publicMetadata?.roles);
+  const next = transform(current);
+  const updated = await client.users.updateUserMetadata(userId, {
+    publicMetadata: { roles: next },
+  });
+  return toStaffUser(updated);
+}
+
+/**
+ * Core logic of {@link assignRole}. Idempotent: assigning a role the user already
+ * holds is a no-op write. See {@link updateUserRoleHandler} for the merge/ordering
+ * contract.
+ */
+export function assignRoleHandler(
+  ctx: AuthContext,
+  getClerk: ClerkClientFactory,
+  userId: string,
+  role: Role,
+): Promise<StaffUser> {
+  return updateUserRoleHandler(ctx, getClerk, userId, (current) => withRole(current, role));
+}
+
+/**
+ * Core logic of {@link removeRole}. Idempotent: removing a role the user does not
+ * hold is a no-op write. See {@link updateUserRoleHandler} for the merge/ordering
+ * contract.
+ */
+export function removeRoleHandler(
+  ctx: AuthContext,
+  getClerk: ClerkClientFactory,
+  userId: string,
+  role: Role,
+): Promise<StaffUser> {
+  return updateUserRoleHandler(ctx, getClerk, userId, (current) => withoutRole(current, role));
+}
+
+/**
+ * List all Clerk users with their current EPD role(s). Admin only. Thin Convex
+ * `action` wrapper over {@link listUsersHandler}, supplying the production Clerk
+ * factory ({@link clerk}).
+ */
 export const listUsers = actionGeneric({
   args: {},
-  handler: async (ctx): Promise<StaffUser[]> => {
-    await assertHasRole(ctx, ["admin"]);
-    const client = clerk();
-
-    const users: StaffUser[] = [];
-    for (let offset = 0; ; offset += CLERK_PAGE_SIZE) {
-      const page = await client.users.getUserList({
-        limit: CLERK_PAGE_SIZE,
-        offset,
-        orderBy: "+created_at",
-      });
-      for (const user of page.data) {
-        users.push(toStaffUser(user));
-      }
-      // `totalCount` is the full directory size; stop once we've collected it.
-      if (users.length >= page.totalCount || page.data.length === 0) {
-        break;
-      }
-    }
-    return users;
-  },
+  handler: (ctx): Promise<StaffUser[]> => listUsersHandler(ctx, clerk),
 });
 
 /**
- * Assign `role` to the user identified by `userId`. Admin only. Idempotent:
- * assigning a role the user already holds is a no-op write.
- *
- * Reads the user's current `public_metadata`, computes the new role set with the
- * pure {@link withRole} helper, and writes back only the `roles` key via
- * `updateUserMetadata` (a shallow merge), so any other public metadata is
- * preserved. Returns the updated staff view.
+ * Assign `role` to the user identified by `userId`. Admin only. Thin Convex
+ * `action` wrapper over {@link assignRoleHandler}.
  *
  * The change takes effect on the user's NEXT Convex call: roles are read from
  * the Clerk JWT, which is reissued with the new `public_metadata.roles` on the
@@ -137,40 +224,16 @@ export const listUsers = actionGeneric({
  */
 export const assignRole = actionGeneric({
   args: { userId: v.string(), role: roleValidator },
-  handler: async (ctx, { userId, role }): Promise<StaffUser> => {
-    await assertHasRole(ctx, ["admin"]);
-    const client = clerk();
-
-    const user = await client.users.getUser(userId);
-    const current = parseRoles(user.publicMetadata?.roles);
-    const next = withRole(current, role);
-    const updated = await client.users.updateUserMetadata(userId, {
-      publicMetadata: { roles: next },
-    });
-    return toStaffUser(updated);
-  },
+  handler: (ctx, { userId, role }): Promise<StaffUser> =>
+    assignRoleHandler(ctx, clerk, userId, role),
 });
 
 /**
- * Remove `role` from the user identified by `userId`. Admin only. Idempotent:
- * removing a role the user does not hold is a no-op write.
- *
- * Same read-modify-write pattern as {@link assignRole}, using the pure
- * {@link withoutRole} helper, preserving any other public metadata. Returns the
- * updated staff view; the change takes effect on the user's next Convex call.
+ * Remove `role` from the user identified by `userId`. Admin only. Thin Convex
+ * `action` wrapper over {@link removeRoleHandler}.
  */
 export const removeRole = actionGeneric({
   args: { userId: v.string(), role: roleValidator },
-  handler: async (ctx, { userId, role }): Promise<StaffUser> => {
-    await assertHasRole(ctx, ["admin"]);
-    const client = clerk();
-
-    const user = await client.users.getUser(userId);
-    const current = parseRoles(user.publicMetadata?.roles);
-    const next = withoutRole(current, role);
-    const updated = await client.users.updateUserMetadata(userId, {
-      publicMetadata: { roles: next },
-    });
-    return toStaffUser(updated);
-  },
+  handler: (ctx, { userId, role }): Promise<StaffUser> =>
+    removeRoleHandler(ctx, clerk, userId, role),
 });

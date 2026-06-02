@@ -1,4 +1,4 @@
-import { ROLES, type Role } from "./auth";
+import { ROLES, type Role, isRole } from "./auth";
 
 /**
  * Pure, network-free helpers for manipulating the set of EPD roles carried on a
@@ -19,10 +19,13 @@ import { ROLES, type Role } from "./auth";
  *     canonical {@link ROLES} order, giving stable, comparable output.
  */
 
-/** Type guard: is `value` one of the known {@link ROLES}? */
-export function isRole(value: unknown): value is Role {
-  return typeof value === "string" && (ROLES as readonly string[]).includes(value);
-}
+/**
+ * Re-export the shared role type guard from auth.ts so callers (and tests) that
+ * reach for "is this a recognized role?" alongside these pure helpers keep a
+ * single, convenient import surface — without a byte-for-byte duplicate of the
+ * guard itself. The implementation lives in auth.ts (the role vocabulary owner).
+ */
+export { isRole };
 
 /**
  * Normalize an arbitrary set of role-like values into a canonical role array:
