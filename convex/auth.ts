@@ -102,8 +102,13 @@ export class PermissionDeniedError extends ConvexError<{
  * Type guard: is `value` one of the known {@link ROLES}? Used to ignore unknown
  * or malformed claim entries so a tampered/legacy token can never smuggle in an
  * unrecognized role.
+ *
+ * Exported as the single source of truth for "is this a recognized role?" — the
+ * pure role-set helpers in userRoles.ts import this rather than re-declaring it,
+ * so the role vocabulary cannot drift between the read (claim) and write
+ * (metadata) sides.
  */
-function isRole(value: unknown): value is Role {
+export function isRole(value: unknown): value is Role {
   return typeof value === "string" && (ROLES as readonly string[]).includes(value);
 }
 

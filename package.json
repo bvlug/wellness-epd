@@ -20,6 +20,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@clerk/backend": "^2.33.5",
     "@clerk/nextjs": "^6.12.0",
     "convex": "^1.21.0",
     "next": "^15.2.0",
