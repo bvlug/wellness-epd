@@ -195,9 +195,9 @@ export const BEHANDELSOORT_NAAM_MAX_LENGTH = 100;
  */
 export class BehandelsoortNaamError extends ConvexError<{
   code: "invalid_naam";
-  reason: "empty" | "too_long";
+  reason: "empty" | "too_long" | "duplicate";
 }> {
-  constructor(reason: "empty" | "too_long") {
+  constructor(reason: "empty" | "too_long" | "duplicate") {
     super({ code: "invalid_naam", reason });
     this.name = "BehandelsoortNaamError";
   }
@@ -266,6 +266,32 @@ export function assertDeletable(referenceCounts: {
 }
 
 /**
+ * Uniqueness guard for the controlled vocabulary (FR-19). The schema's `by_naam`
+ * index advertises name uniqueness; this is where it is actually enforced. No
+ * two ACTIVE behandelsoorten may share a name, compared case-insensitively and
+ * whitespace-trimmed, so staff never sees two indistinguishable dropdown
+ * entries. A deactivated entry does NOT reserve its name — a retired name may be
+ * reused. `excludeId` skips the entry being renamed, so renaming an entry to its
+ * own current name (or a case variant of it) is not a self-clash. Throws
+ * {@link BehandelsoortNaamError} `duplicate`. Pure and unit-testable; the handler
+ * fetches the existing rows and passes them in.
+ */
+export function assertNameAvailable(
+  naam: string,
+  existing: readonly BehandelsoortDoc[],
+  excludeId?: GenericId<"behandelsoort">,
+): void {
+  const folded = naam.trim().toLowerCase();
+  const clash = existing.some(
+    (entry) =>
+      entry.actief && entry._id !== excludeId && entry.naam.trim().toLowerCase() === folded,
+  );
+  if (clash) {
+    throw new BehandelsoortNaamError("duplicate");
+  }
+}
+
+/**
  * The Convex `db` slice the admin mutations need, declared narrowly (mirroring
  * `convex/patients.ts`) so the logic stays close to the real handle while the
  * pure helpers above carry the rules. `query(...).withIndex(...)` is the
@@ -283,13 +309,20 @@ interface BehandelsoortMutationContext extends AuthContext, AuditMutationContext
       fields: Partial<{ naam: string; actief: boolean }>,
     ) => Promise<void>;
     delete: (id: GenericId<"behandelsoort">) => Promise<void>;
-    query: (table: "afspraak" | "behandeling") => {
-      withIndex: (
-        index: "by_behandelsoort",
-        range: (q: {
-          eq: (field: "behandelsoortId", value: GenericId<"behandelsoort">) => unknown;
-        }) => unknown,
-      ) => { first: () => Promise<unknown | null> };
+    query: {
+      // Reference lookup for the A-27 hard-delete check.
+      (
+        table: "afspraak" | "behandeling",
+      ): {
+        withIndex: (
+          index: "by_behandelsoort",
+          range: (q: {
+            eq: (field: "behandelsoortId", value: GenericId<"behandelsoort">) => unknown;
+          }) => unknown,
+        ) => { first: () => Promise<unknown | null> };
+      };
+      // Full read for the case-folded uniqueness check on create/rename.
+      (table: "behandelsoort"): { collect: () => Promise<BehandelsoortDoc[]> };
     };
   };
 }
@@ -325,6 +358,8 @@ export const createBehandelsoort = mutationGeneric({
     const naam = normalizeBehandelsoortNaam(args.naam);
 
     const mutationCtx = ctx as unknown as BehandelsoortMutationContext;
+    // Enforce the name uniqueness the schema's `by_naam` index advertises.
+    assertNameAvailable(naam, await mutationCtx.db.query("behandelsoort").collect());
     const behandelsoortId = await mutationCtx.db.insert("behandelsoort", { naam, actief: true });
 
     await logAudit(mutationCtx, {
@@ -352,6 +387,9 @@ export const renameBehandelsoort = mutationGeneric({
 
     const mutationCtx = ctx as unknown as BehandelsoortMutationContext;
     await requireBehandelsoort(mutationCtx.db, args.id);
+    // Reject a rename that collides with another active entry (case-folded);
+    // renaming to the entry's own current name is allowed (excludeId).
+    assertNameAvailable(naam, await mutationCtx.db.query("behandelsoort").collect(), args.id);
     await mutationCtx.db.patch(args.id, { naam });
 
     await logAudit(mutationCtx, {

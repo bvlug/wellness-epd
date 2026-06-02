@@ -64,9 +64,13 @@ function describeError(error: unknown): string {
       return "Deze behandelsoort bestaat niet meer.";
     }
     if (data?.code === "invalid_naam") {
-      return data.reason === "too_long"
-        ? "De naam is te lang."
-        : "Geef een naam op voor de behandelsoort.";
+      if (data.reason === "too_long") {
+        return "De naam is te lang.";
+      }
+      if (data.reason === "duplicate") {
+        return "Er bestaat al een actieve behandelsoort met deze naam.";
+      }
+      return "Geef een naam op voor de behandelsoort.";
     }
   }
   return "Er ging iets mis. Probeer het opnieuw.";

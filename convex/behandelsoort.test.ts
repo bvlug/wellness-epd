@@ -9,6 +9,7 @@ import {
   InactiveBehandelsoortError,
   assertActiveBehandelsoort,
   assertDeletable,
+  assertNameAvailable,
   normalizeBehandelsoortNaam,
   toActiveOptions,
   toAdminRows,
@@ -202,5 +203,53 @@ describe("assertDeletable (A-27 referential integrity)", () => {
         code: "behandelsoort_referenced",
       });
     }
+  });
+});
+
+describe("assertNameAvailable (FR-19 name uniqueness)", () => {
+  it("allows a name that no active entry uses", () => {
+    const existing = [bs("Klassiek", true), bs("Sportmassage", true)];
+    expect(() => assertNameAvailable("Hot stone", existing)).not.toThrow();
+  });
+
+  it("rejects an exact duplicate of an active entry", () => {
+    const existing = [bs("Klassiek", true)];
+    expect(() => assertNameAvailable("Klassiek", existing)).toThrow(BehandelsoortNaamError);
+  });
+
+  it("rejects a case- and whitespace-variant duplicate of an active entry", () => {
+    const existing = [bs("Klassiek", true)];
+    expect(() => assertNameAvailable("  klassiek  ", existing)).toThrow(BehandelsoortNaamError);
+  });
+
+  it("surfaces the duplicate reason in the error payload", () => {
+    try {
+      assertNameAvailable("Klassiek", [bs("Klassiek", true)]);
+      throw new Error("expected assertNameAvailable to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(BehandelsoortNaamError);
+      expect((error as BehandelsoortNaamError).data).toEqual({
+        code: "invalid_naam",
+        reason: "duplicate",
+      });
+    }
+  });
+
+  it("allows reusing the name of a DEACTIVATED entry (inactive does not reserve)", () => {
+    const existing = [bs("Klassiek", false)];
+    expect(() => assertNameAvailable("Klassiek", existing)).not.toThrow();
+  });
+
+  it("allows renaming an entry to its own current name (excludeId skips self)", () => {
+    const self = bs("Klassiek", true);
+    expect(() => assertNameAvailable("Klassiek", [self], self._id)).not.toThrow();
+  });
+
+  it("still rejects a rename that collides with a DIFFERENT active entry", () => {
+    const self = bs("Klassiek", true);
+    const other = bs("Sportmassage", true);
+    expect(() => assertNameAvailable("Sportmassage", [self, other], self._id)).toThrow(
+      BehandelsoortNaamError,
+    );
   });
 });
