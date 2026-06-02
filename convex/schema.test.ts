@@ -93,6 +93,7 @@ describe("afspraak", () => {
       "durationMinutes",
       "status",
     ]) {
+      expect(f[field], field).toBeDefined();
       expect(f[field].optional, `${field} must be required`).toBe(false);
     }
   });
@@ -119,6 +120,7 @@ describe("behandeling", () => {
       "behandelverslag",
       "status",
     ]) {
+      expect(f[field], field).toBeDefined();
       expect(f[field].optional, `${field} must be required`).toBe(false);
     }
   });
@@ -155,6 +157,7 @@ describe("audit_log", () => {
       "resourceId",
       "timestamp",
     ]) {
+      expect(f[field], field).toBeDefined();
       expect(f[field].optional, `${field} must be required`).toBe(false);
     }
   });
@@ -196,21 +199,31 @@ describe("controlled vocabularies match the FRD", () => {
 });
 
 describe("audit_log is append-only (BR-13)", () => {
-  it("no convex/*.ts source performs an update or delete on audit_log", () => {
+  // This is a static tripwire, not full enforcement. A mutation receives a
+  // document Id (e.g. `row._id`), never the table-name string, so we cannot
+  // reliably tell from text whether a given `db.patch/replace/delete` targets
+  // audit_log specifically. Instead we rely on encapsulation: the table name
+  // "audit_log" is referenced only by the module(s) that read/append the log
+  // (the insert-only audit writer arrives with #17); domain mutations go
+  // through that writer and never name the table. So the honest, deterministic
+  // rule is: any convex source file that references the audit_log table must
+  // not contain a patch/replace/delete call at all. That keeps the audit
+  // module insert/query-only, and conservatively flags (for human BR-13
+  // review) any future file that mixes audit_log access with mutating calls.
+  // Authoritative insert-only enforcement is owned by the audit writer in #17.
+  it("no convex source that references audit_log performs patch/replace/delete", () => {
     const convexDir = dirname(fileURLToPath(import.meta.url));
     const sources = readdirSync(convexDir).filter(
       (name) => name.endsWith(".ts") && !name.endsWith(".test.ts"),
     );
 
-    const offenders: string[] = [];
-    for (const name of sources) {
+    const mutatingCall = /\.(patch|replace|delete)\s*\(/;
+    const referencesAuditLog = /\baudit_log\b/;
+
+    const offenders = sources.filter((name) => {
       const content = readFileSync(join(convexDir, name), "utf8");
-      // Flag any db.patch/replace/delete whose statement also names audit_log.
-      const mutationRe = /\.(patch|replace|delete)\s*\([^;]*audit_log/gs;
-      if (mutationRe.test(content)) {
-        offenders.push(name);
-      }
-    }
+      return referencesAuditLog.test(content) && mutatingCall.test(content);
+    });
 
     expect(offenders).toEqual([]);
   });
