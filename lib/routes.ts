@@ -1,23 +1,23 @@
 /**
- * Route policy shared between the Clerk middleware and its tests.
+ * Route policy for the Clerk middleware — the single source of truth for which
+ * paths are reachable without an authenticated Clerk session.
  *
- * `PUBLIC_ROUTE_PATTERNS` are the only paths reachable without an authenticated
- * Clerk session — the sign-in and sign-up catch-all routes. Everything else is
- * a protected EPD page. Keeping the patterns here (rather than inline in
- * middleware.ts) lets us unit-test the classification without constructing a
- * Next.js request, and gives a single source of truth for "what is public".
+ * Only the Clerk auth UI is public: the sign-in and sign-up pages themselves and
+ * their catch-all sub-routes (SSO callbacks, factor steps, email verification).
+ * Everything else is a protected EPD page.
+ *
+ * The patterns are interpreted by Clerk's `createRouteMatcher` (path-to-regexp).
+ * They are intentionally written as an exact base (`/sign-in`) plus a nested
+ * wildcard (`/sign-in/(.*)`) rather than `/sign-in(.*)`: the latter is an
+ * unanchored suffix match that would also make e.g. `/sign-in-history` public.
+ *
+ * `middleware.ts` builds the live matcher from these patterns; `routes.test.ts`
+ * exercises that same matcher, so the test reflects the real gate (no parallel
+ * re-implementation that could drift).
  */
-export const PUBLIC_ROUTE_PATTERNS = ["/sign-in(.*)", "/sign-up(.*)"] as const;
-
-/**
- * Pure predicate mirroring how Clerk's `createRouteMatcher` treats the patterns
- * above: a pathname is public when it equals, or is nested under, `/sign-in` or
- * `/sign-up`. Used directly by tests; the middleware uses Clerk's matcher built
- * from the same patterns so the two stay in lock-step.
- */
-export function isPublicPath(pathname: string): boolean {
-  return PUBLIC_ROUTE_PATTERNS.some((pattern) => {
-    const base = pattern.replace("(.*)", "");
-    return pathname === base || pathname.startsWith(`${base}/`);
-  });
-}
+export const PUBLIC_ROUTE_PATTERNS = [
+  "/sign-in",
+  "/sign-in/(.*)",
+  "/sign-up",
+  "/sign-up/(.*)",
+] as const;
