@@ -148,6 +148,14 @@ export function PatientProfile({ patientId }: { patientId: string }) {
           {!patient.actief && (
             <span style={{ color: "#b00020", fontSize: "0.875rem" }}>(gedeactiveerd)</span>
           )}
+          {/*
+            Edit affordance (Story P-1-S3). Visible to every viewer; the edit
+            page's Convex mutation is the real authority and denies a caller who
+            lacks the balie/admin role (AC-2), so showing the link broadly is safe.
+          */}
+          <Link href={PATIENT_ROUTES.edit(patient._id)} style={{ marginLeft: "auto" }}>
+            Bewerken
+          </Link>
         </header>
 
         <dl style={{ display: "grid", gridTemplateColumns: "12rem 1fr", gap: "0.4rem 1rem" }}>

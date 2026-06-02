@@ -37,6 +37,12 @@ export const PATIENT_ROUTES = {
    */
   profile: (patientId: string): string => `/patienten/${patientId}`,
   /**
+   * The edit form for an existing patient (Story P-1-S3 / #22). The profile page
+   * links here; on a successful save the edit flow redirects back to
+   * {@link PATIENT_ROUTES.profile}.
+   */
+  edit: (patientId: string): string => `/patienten/${patientId}/bewerken`,
+  /**
    * A patient's full behandeling history (Story P-1-S2 "view full history"
    * link). The dedicated history page belongs to a later Behandelingen story;
    * this helper fixes the URL shape now so the profile link is stable and the

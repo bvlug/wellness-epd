@@ -1,6 +1,6 @@
 "use client";
 
-import type { PatientCreationErrorData } from "@/convex/patients";
+import type { PatientProfileView, PatientUpdateErrorData } from "@/convex/patients";
 import { GESLACHT_VALUES } from "@/convex/schema";
 import {
   type PatientField,
@@ -12,31 +12,60 @@ import { useMutation } from "convex/react";
 import { makeFunctionReference } from "convex/server";
 import { ConvexError } from "convex/values";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { PatientFormField as Field } from "./PatientFormField";
 
 /**
- * "Nieuwe patiënt" form (Story P-1-S1; FR-1). A client component that collects
- * the required and optional patient fields, runs the SHARED
+ * "Patiënt bewerken" form (Story P-1-S3; FR-2). A client component that loads an
+ * existing patient, prefills the editable fields, runs the SHARED
  * {@link validatePatientInput} for instant client-side feedback, and calls the
- * Convex `createPatient` mutation — which re-validates and authorizes
- * server-side (the form's checks are convenience only; the server is the
- * authority, AC-2). On success it redirects to the new patient's profile page.
+ * Convex `updatePatient` mutation — which re-validates, authorizes (balie/admin,
+ * AC-2), and re-checks the BSN duplicate gate server-side (the form's checks are
+ * convenience only; the server is the authority). On success it returns to the
+ * patient's profile page showing the new values.
  *
- * User-facing copy is Dutch (project convention); domain terms stay Dutch.
+ * It reuses the create form's {@link Field} (inline-error) pattern and the same
+ * validation, exactly as P-1-S3 requires. Domain terms and user-facing copy stay
+ * Dutch (project convention).
  *
- * AVG/GDPR (BR-11): the BSN value is never written to the console or shown back
- * inside an error message — field errors reference the field, not the value.
+ * AVG/GDPR (BR-11): the BSN value is never written to the console or echoed in an
+ * error message — field errors reference the field, not the value.
+ *
+ * **Loading the current values.** We reuse the profile view path
+ * (`patients:getPatientForView`) to fetch the record; it is the authorized read
+ * for a patient and already returns every editable field. Note it also writes a
+ * `view` audit entry — opening the edit form is a legitimate view of the record,
+ * so this is acceptable; the subsequent save writes its own `edit` entry (AC-9).
  */
 
 /**
- * Offline-safe reference to the Convex mutation. Mirrors the codebase pattern
- * (`me.ts` uses `queryGeneric`): we avoid importing the generated `api` object
- * (`convex/_generated` is gitignored and only exists after codegen) and instead
- * name the function by its `"file:export"` path. Once codegen has run this can
- * be swapped for `api.patients.createPatient` without changing behavior.
+ * Offline-safe references to the Convex functions, named by their `"file:export"`
+ * path (the generated `api` object is gitignored — codebase pattern). The view
+ * mutation loads the current values; the update mutation persists the edit.
  */
-const createPatientRef = makeFunctionReference<"mutation">("patients:createPatient");
+const getPatientForViewRef = makeFunctionReference<
+  "mutation",
+  { patientId: string },
+  PatientProfileView
+>("patients:getPatientForView");
+
+const updatePatientRef = makeFunctionReference<
+  "mutation",
+  {
+    patientId: string;
+    voornaam?: string;
+    tussenvoegsel?: string;
+    achternaam?: string;
+    geboortedatum?: string;
+    geslacht?: (typeof GESLACHT_VALUES)[number];
+    bsn?: string;
+    email?: string;
+    telefoonnummer?: string;
+    notities?: string;
+    acknowledgeDuplicate?: boolean;
+  },
+  { patientId: string }
+>("patients:updatePatient");
 
 type FieldErrors = Partial<Record<PatientField, string>>;
 
@@ -47,53 +76,93 @@ const GESLACHT_LABELS: Record<(typeof GESLACHT_VALUES)[number], string> = {
   onbekend: "Onbekend",
 };
 
-const EMPTY_FORM: PatientInput = {
-  voornaam: "",
-  tussenvoegsel: "",
-  achternaam: "",
-  geboortedatum: "",
-  geslacht: "",
-  bsn: "",
-  email: "",
-  telefoonnummer: "",
-  notities: "",
-};
+/** Map the loaded patient record into the editable form shape. */
+function toForm(patient: PatientProfileView["patient"]): PatientInput {
+  return {
+    voornaam: patient.voornaam,
+    tussenvoegsel: patient.tussenvoegsel ?? "",
+    achternaam: patient.achternaam,
+    geboortedatum: patient.geboortedatum,
+    geslacht: patient.geslacht,
+    bsn: patient.bsn,
+    email: patient.email ?? "",
+    telefoonnummer: patient.telefoonnummer ?? "",
+    notities: patient.notities ?? "",
+  };
+}
 
-/** Narrow an unknown thrown value to the structured creation-error payload. */
-function asCreationError(error: unknown): PatientCreationErrorData | null {
+/** Narrow an unknown thrown value to the structured update-error payload. */
+function asUpdateError(error: unknown): PatientUpdateErrorData | null {
   if (error instanceof ConvexError) {
     const { data } = error;
     if (data && typeof data === "object" && "code" in data) {
-      return data as PatientCreationErrorData;
+      return data as PatientUpdateErrorData;
     }
   }
   return null;
 }
 
-export function NewPatientForm() {
-  const router = useRouter();
-  const createPatient = useMutation(createPatientRef);
+type LoadState =
+  | { status: "loading" }
+  | { status: "loaded" }
+  | { status: "not_found" }
+  | { status: "error" };
 
-  const [form, setForm] = useState<PatientInput>(EMPTY_FORM);
+export function EditPatientForm({ patientId }: { patientId: string }) {
+  const router = useRouter();
+  const getPatientForView = useMutation(getPatientForViewRef);
+  const updatePatient = useMutation(updatePatientRef);
+
+  const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [form, setForm] = useState<PatientInput | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [duplicate, setDuplicate] = useState<{ canOverride: boolean } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // Load the current values exactly once per patient (Strict Mode fires effects
+  // twice in dev; the ref keeps us to a single load, mirroring PatientProfile).
+  const loadedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (loadedForRef.current === patientId) {
+      return;
+    }
+    loadedForRef.current = patientId;
+    setState({ status: "loading" });
+    void (async () => {
+      try {
+        const data = await getPatientForView({ patientId });
+        setForm(toForm(data.patient));
+        setState({ status: "loaded" });
+      } catch (error) {
+        if (error instanceof ConvexError) {
+          const data = error.data as { code?: string } | undefined;
+          if (data?.code === "patient_not_found") {
+            setState({ status: "not_found" });
+            return;
+          }
+        }
+        setState({ status: "error" });
+      }
+    })();
+  }, [getPatientForView, patientId]);
+
   function update<K extends keyof PatientInput>(key: K, value: PatientInput[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((prev) => (prev === null ? prev : { ...prev, [key]: value }));
   }
 
   function collectFieldErrors(input: PatientInput): FieldErrors {
     const errors: FieldErrors = {};
     for (const error of validatePatientInput(input)) {
-      // Keep the first message per field.
       errors[error.field] ??= error.message;
     }
     return errors;
   }
 
   async function submit(acknowledgeDuplicate: boolean) {
+    if (form === null) {
+      return;
+    }
     setFormError(null);
 
     const clientErrors = collectFieldErrors(form);
@@ -105,7 +174,11 @@ export function NewPatientForm() {
 
     setSubmitting(true);
     try {
-      const result = await createPatient({
+      // Send the full editable set; the server merges it as a partial update and
+      // re-validates. Optional contact fields are sent as undefined when blank so
+      // a cleared field is persisted as "removed" rather than an empty string.
+      await updatePatient({
+        patientId,
         voornaam: form.voornaam,
         tussenvoegsel: form.tussenvoegsel || undefined,
         achternaam: form.achternaam,
@@ -117,9 +190,9 @@ export function NewPatientForm() {
         notities: form.notities || undefined,
         acknowledgeDuplicate: acknowledgeDuplicate || undefined,
       });
-      router.push(PATIENT_ROUTES.profile(result.patientId));
+      router.push(PATIENT_ROUTES.profile(patientId));
     } catch (error) {
-      const data = asCreationError(error);
+      const data = asUpdateError(error);
       if (data?.code === "validation_failed") {
         const errors: FieldErrors = {};
         for (const e of data.errors) {
@@ -128,8 +201,10 @@ export function NewPatientForm() {
         setFieldErrors(errors);
       } else if (data?.code === "duplicate_bsn") {
         setDuplicate({ canOverride: data.canOverride });
+      } else if (data?.code === "patient_not_found") {
+        setFormError("Deze patiënt bestaat niet (meer).");
       } else {
-        setFormError("Aanmaken is mislukt. Probeer het opnieuw.");
+        setFormError("Opslaan is mislukt. Probeer het opnieuw.");
       }
     } finally {
       setSubmitting(false);
@@ -140,6 +215,26 @@ export function NewPatientForm() {
     event.preventDefault();
     setDuplicate(null);
     void submit(false);
+  }
+
+  if (state.status === "loading") {
+    return <p>Gegevens laden…</p>;
+  }
+
+  if (state.status === "not_found") {
+    return (
+      <div role="alert">
+        <p>Deze patiënt bestaat niet (meer).</p>
+      </div>
+    );
+  }
+
+  if (state.status === "error" || form === null) {
+    return (
+      <p role="alert" style={{ color: "#b00020" }}>
+        De gegevens konden niet worden geladen. Probeer het opnieuw.
+      </p>
+    );
   }
 
   return (
@@ -245,7 +340,7 @@ export function NewPatientForm() {
       {duplicate !== null && (
         <div role="alert" style={{ border: "1px solid #b8860b", padding: "0.75rem" }}>
           <p style={{ margin: "0 0 0.5rem" }}>
-            Er bestaat al een actieve patiënt met dit BSN. Een dubbele registratie wordt niet
+            Er bestaat al een andere actieve patiënt met dit BSN. De wijziging wordt niet
             opgeslagen.
           </p>
           {duplicate.canOverride ? (
@@ -267,7 +362,7 @@ export function NewPatientForm() {
       )}
 
       <button type="submit" disabled={submitting}>
-        {submitting ? "Bezig met opslaan…" : "Patiënt aanmaken"}
+        {submitting ? "Bezig met opslaan…" : "Wijzigingen opslaan"}
       </button>
     </form>
   );
