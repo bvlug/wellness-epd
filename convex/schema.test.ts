@@ -227,4 +227,23 @@ describe("audit_log is append-only (BR-13)", () => {
 
     expect(offenders).toEqual([]);
   });
+
+  it("confirms audit.ts is the sole legitimate audit_log referencer and is insert-only (#17)", () => {
+    // Insert-only enforcement is owned by the audit writer (#17). Here we pin
+    // the encapsulation the tripwire above relies on: aside from schema.ts
+    // (which DEFINES the table but performs no data access), exactly the audit
+    // writer (audit.ts) names the audit_log table — domain mutations must go
+    // through it and never name the table themselves. The writer's own
+    // no-patch/replace/delete and insert-only guarantees are asserted in
+    // audit.test.ts; this keeps the boundary honest if a future file starts
+    // referencing audit_log directly.
+    const convexDir = dirname(fileURLToPath(import.meta.url));
+    const referencesAuditLog = /\baudit_log\b/;
+
+    const referencers = readdirSync(convexDir)
+      .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "schema.ts")
+      .filter((name) => referencesAuditLog.test(readFileSync(join(convexDir, name), "utf8")));
+
+    expect(referencers).toEqual(["audit.ts"]);
+  });
 });
