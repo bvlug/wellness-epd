@@ -102,7 +102,12 @@ export default defineSchema({
   })
     .index("by_patient", ["patientId"])
     .index("by_behandelaar_and_start", ["behandelaarId", "startDatetime"])
-    .index("by_start", ["startDatetime"]),
+    .index("by_start", ["startDatetime"])
+    // Backs the A-27 referential-integrity check: before a behandelsoort may be
+    // hard-deleted, the delete mutation looks up whether ANY afspraak references
+    // it. The index makes "does any afspraak point at this behandelsoort?" a
+    // bounded lookup instead of a full-table scan.
+    .index("by_behandelsoort", ["behandelsoortId"]),
 
   /**
    * Recorded treatment (FR-13..FR-18). `behandelsoortId` is a required FK that
@@ -125,7 +130,11 @@ export default defineSchema({
     finalizedAt: v.optional(v.number()),
   })
     .index("by_patient", ["patientId"])
-    .index("by_afspraak", ["afspraakId"]),
+    .index("by_afspraak", ["afspraakId"])
+    // Backs the A-27 referential-integrity check (see afspraak.by_behandelsoort):
+    // the behandelsoort hard-delete mutation checks for any referencing
+    // behandeling through this index.
+    .index("by_behandelsoort", ["behandelsoortId"]),
 
   /**
    * Controlled vocabulary of treatment types (FR-19, BR-12), shared by afspraak
