@@ -1,0 +1,8 @@
+# pnpm settings. `allowBuilds` decides which packages may run install scripts
+# (pnpm blocks build scripts by default for supply-chain safety). These are the
+# trusted toolchain native binaries this project needs at install time.
+allowBuilds:
+  "@biomejs/biome": true
+  "@clerk/shared": true
+  esbuild: true
+  sharp: true
