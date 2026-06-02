@@ -237,3 +237,91 @@ export const removeRole = actionGeneric({
   handler: (ctx, { userId, role }): Promise<StaffUser> =>
     removeRoleHandler(ctx, clerk, userId, role),
 });
+
+/* -------------------------------------------------------------------------- */
+/* Behandelaar selection list (Story A-1-S1; FR-6, BR-7).                     */
+/* -------------------------------------------------------------------------- */
+
+/** Minimal behandelaar option for the afspraak-form dropdown (no PII beyond name). */
+export interface Behandelaar {
+  id: string;
+  name: string | null;
+}
+
+/** The staff fields the active-behandelaar filter reasons over. */
+export interface BehandelaarCandidate {
+  id: string;
+  name: string | null;
+  roles: Role[];
+  /** Clerk account flags — a deactivated staff member is banned or locked. */
+  banned: boolean;
+  locked: boolean;
+}
+
+/**
+ * Pure selection of the active behandelaars from a staff list (BR-7): a user is
+ * offered in the afspraak dropdown only if they currently hold the `behandelaar`
+ * role AND their Clerk account is neither banned nor locked. A behandelaar who
+ * was deactivated, or had the role removed, is therefore absent. Sorted by name
+ * (Dutch collation) for a stable, readable dropdown. Decoupled from Clerk/Convex
+ * so the rule is unit-testable.
+ */
+export function selectActiveBehandelaars(users: readonly BehandelaarCandidate[]): Behandelaar[] {
+  return users
+    .filter((user) => user.roles.includes("behandelaar") && !user.banned && !user.locked)
+    .map((user) => ({ id: user.id, name: user.name }))
+    .sort((a, b) => (a.name ?? "").localeCompare(b.name ?? "", "nl"));
+}
+
+/**
+ * Core logic of {@link listBehandelaars}, decoupled from the `action` wrapper and
+ * the production secret so it is unit-testable with a mocked Clerk client.
+ *
+ * SECURITY ORDERING: `assertHasRole` runs FIRST and `getClerk` is only invoked
+ * once authorization passes — a non-balie/admin caller never reaches the Clerk
+ * network layer. Authorized to `balie` and `admin` (the roles that schedule
+ * afspraken); a behandelaar-only caller does not create afspraken (AC-2) and so
+ * does not need this list.
+ *
+ * Pages the full Clerk directory, then applies {@link selectActiveBehandelaars}.
+ */
+export async function listBehandelaarsHandler(
+  ctx: AuthContext,
+  getClerk: ClerkClientFactory,
+): Promise<Behandelaar[]> {
+  await assertHasRole(ctx, ["balie", "admin"]);
+  const client = getClerk();
+
+  const candidates: BehandelaarCandidate[] = [];
+  for (let offset = 0; ; offset += CLERK_PAGE_SIZE) {
+    const page = await client.users.getUserList({
+      limit: CLERK_PAGE_SIZE,
+      offset,
+      orderBy: "+created_at",
+    });
+    for (const user of page.data) {
+      const staff = toStaffUser(user);
+      candidates.push({
+        id: staff.id,
+        name: staff.name,
+        roles: staff.roles,
+        banned: user.banned,
+        locked: user.locked,
+      });
+    }
+    if (candidates.length >= page.totalCount || page.data.length === 0) {
+      break;
+    }
+  }
+  return selectActiveBehandelaars(candidates);
+}
+
+/**
+ * List active behandelaars for the afspraak form's behandelaar dropdown (BR-7).
+ * Callable by balie/admin. Thin Convex `action` wrapper over
+ * {@link listBehandelaarsHandler}, supplying the production Clerk factory.
+ */
+export const listBehandelaars = actionGeneric({
+  args: {},
+  handler: (ctx): Promise<Behandelaar[]> => listBehandelaarsHandler(ctx, clerk),
+});

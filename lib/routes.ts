@@ -38,3 +38,12 @@ export const PATIENT_ROUTES = {
    */
   profile: (patientId: string): string => `/patienten/${patientId}`,
 } as const;
+
+/**
+ * Afspraken (appointments) route helpers (Story A-1-S1). Protected, like the
+ * patient routes, so the Clerk middleware gates them.
+ */
+export const AFSPRAAK_ROUTES = {
+  /** The "New afspraak" scheduling form. */
+  new: "/afspraken/nieuw",
+} as const;

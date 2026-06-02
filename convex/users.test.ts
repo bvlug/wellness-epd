@@ -3,11 +3,15 @@ import type { UserIdentity } from "convex/server";
 import { describe, expect, it, vi } from "vitest";
 import { type AuthContext, PermissionDeniedError, UnauthenticatedError } from "./auth";
 import {
+  type Behandelaar,
+  type BehandelaarCandidate,
   type ClerkClientFactory,
   type StaffUser,
   assignRoleHandler,
+  listBehandelaarsHandler,
   listUsersHandler,
   removeRoleHandler,
+  selectActiveBehandelaars,
 } from "./users";
 
 /**
@@ -382,5 +386,108 @@ describe("listUsers pagination", () => {
 
     expect(getUserList).toHaveBeenCalledTimes(1);
     expect(result).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Behandelaar selection list (Story A-1-S1; FR-6, BR-7)
+// ---------------------------------------------------------------------------
+
+const behandelaarIdentity = {
+  subject: "user_synthetic_behandelaar",
+  issuer: "https://example.clerk.accounts.dev",
+  tokenIdentifier: "https://example.clerk.accounts.dev|user_synthetic_behandelaar",
+  roles: ["behandelaar"],
+} as unknown as UserIdentity;
+
+describe("selectActiveBehandelaars (BR-7, pure)", () => {
+  function candidate(over: Partial<BehandelaarCandidate> = {}): BehandelaarCandidate {
+    return { id: "u", name: "Naam", roles: ["behandelaar"], banned: false, locked: false, ...over };
+  }
+
+  it("includes active behandelaars, including multi-role ones (A-2)", () => {
+    const out = selectActiveBehandelaars([
+      candidate({ id: "a", name: "Anna", roles: ["behandelaar"] }),
+      candidate({ id: "b", name: "Bram", roles: ["behandelaar", "balie"] }),
+    ]);
+    expect(out.map((b) => b.id)).toEqual(["a", "b"]);
+  });
+
+  it("excludes users without the behandelaar role", () => {
+    expect(selectActiveBehandelaars([candidate({ id: "x", roles: ["balie", "admin"] })])).toEqual(
+      [],
+    );
+  });
+
+  it("excludes deactivated (banned or locked) behandelaars (BR-7)", () => {
+    expect(
+      selectActiveBehandelaars([
+        candidate({ id: "banned", banned: true }),
+        candidate({ id: "locked", locked: true }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("sorts by name with Dutch collation", () => {
+    const out = selectActiveBehandelaars([
+      candidate({ id: "z", name: "Zoë" }),
+      candidate({ id: "a", name: "Aart" }),
+    ]);
+    expect(out.map((b) => b.name)).toEqual(["Aart", "Zoë"]);
+  });
+
+  it("projects to id + name only", () => {
+    const [option] = selectActiveBehandelaars([candidate({ id: "a", name: "Anna" })]);
+    expect(Object.keys(option as Behandelaar).sort()).toEqual(["id", "name"]);
+  });
+});
+
+describe("listBehandelaarsHandler (auth + active filter)", () => {
+  /** A Clerk `User` with role metadata plus the banned/locked account flags. */
+  function staffUser(over: {
+    id: string;
+    firstName?: string | null;
+    roles?: string[];
+    banned?: boolean;
+    locked?: boolean;
+  }): User {
+    return {
+      ...fakeUser({
+        id: over.id,
+        firstName: over.firstName ?? null,
+        publicMetadata: { roles: over.roles ?? [] },
+      }),
+      banned: over.banned ?? false,
+      locked: over.locked ?? false,
+    } as User;
+  }
+
+  it("denies a behandelaar-only caller and never builds a Clerk client (AC-2)", async () => {
+    const { client } = mockClerk();
+    const spy = spyFactory(client);
+    await expect(
+      listBehandelaarsHandler(ctxWithIdentity(behandelaarIdentity), spy.factory),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
+    expect(spy.calls()).toBe(0);
+  });
+
+  it("denies an anonymous caller", async () => {
+    await expect(
+      listBehandelaarsHandler(ctxWithIdentity(null), neverFactory()),
+    ).rejects.toBeInstanceOf(UnauthenticatedError);
+  });
+
+  it("allows balie and returns only active behandelaars", async () => {
+    const { client, getUserList } = mockClerk();
+    getUserList.mockResolvedValue({
+      data: [
+        staffUser({ id: "b1", firstName: "Bea", roles: ["behandelaar"] }),
+        staffUser({ id: "b2", firstName: "Ban", roles: ["behandelaar"], banned: true }),
+        staffUser({ id: "r1", firstName: "Rik", roles: ["balie"] }),
+      ],
+      totalCount: 3,
+    });
+    const out = await listBehandelaarsHandler(ctxWithIdentity(balieIdentity), () => client);
+    expect(out.map((b) => b.id)).toEqual(["b1"]);
   });
 });
