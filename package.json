@@ -15,7 +15,7 @@
     "convex:deploy": "convex deploy",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p convex/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -8,9 +8,11 @@ import type { ReactNode } from "react";
 const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
 
 /**
- * A single Convex client instance for the browser session. Created lazily so a
- * missing NEXT_PUBLIC_CONVEX_URL does not crash the production build's
- * prerender step — it only matters once the app actually runs in the browser.
+ * A single Convex client instance, reused across renders for the browser
+ * session. The build's prerender step is kept from crashing on a missing
+ * NEXT_PUBLIC_CONVEX_URL by `export const dynamic = "force-dynamic"` in the
+ * root layout — not by this lazy initialization. If that layout export is
+ * removed, `next build` will start throwing here during prerender.
  */
 let convexClient: ConvexReactClient | undefined;
 
