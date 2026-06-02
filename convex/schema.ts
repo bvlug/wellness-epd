@@ -52,7 +52,10 @@ export default defineSchema({
    * (BR-2, BR-11) — never logged. Format/Elfproef/uniqueness checks are enforced
    * in the create/edit mutations, not by the schema validator (which only fixes
    * presence and type). The `by_bsn` index backs exact-BSN search (FR-4) and the
-   * active-uniqueness check (EH-4).
+   * active-uniqueness check (EH-4). The `by_achternaam` index backs the
+   * prefix/partial last-name search (FR-4, Story P-2-S1): a case-normalized
+   * achternaam range scan, so name search reads only the matching key range
+   * rather than scanning the whole table.
    */
   patient: defineTable({
     voornaam: v.string(),
@@ -75,7 +78,9 @@ export default defineSchema({
     ),
     notities: v.optional(v.string()),
     actief: v.boolean(),
-  }).index("by_bsn", ["bsn"]),
+  })
+    .index("by_bsn", ["bsn"])
+    .index("by_achternaam", ["achternaam"]),
 
   /**
    * Scheduled appointment (FR-6..FR-12). `behandelaarId` is a Clerk user id

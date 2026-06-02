@@ -4,9 +4,15 @@ import type { PatientInput } from "../lib/patient-validation";
 import type { Role } from "./auth";
 import {
   PatientCreationError,
+  SEARCH_RESULT_LIMIT,
+  type SearchablePatient,
   buildPatientDocument,
   canOverrideDuplicate,
+  hasUsableCriteria,
+  matchesCriteria,
+  normalizeSearchCriteria,
   resolvePatientCreation,
+  resolvePatientSearch,
 } from "./patients";
 
 /**
@@ -222,3 +228,178 @@ describe("PatientCreationError", () => {
 // (AC-2). The runtime denial path is covered by auth.test.ts (assertHasRole).
 const _createRoles: readonly Role[] = ["balie", "admin"];
 void _createRoles;
+
+/* -------------------------------------------------------------------------- */
+/* Patient search core (Story P-2-S1; FR-4, BR-4, BR-11, EH-1, A-10).         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Tests for the pure patient-search core the `searchPatients` Convex query
+ * wires up. All BSNs/names are SYNTHETIC (AVG/GDPR, BR-11). The live Convex
+ * deployment (index reads, auth) is verified manually; here we exercise the
+ * rules that must hold regardless of runtime: BR-4 empty→[], EH-1 active-only +
+ * no-inactive-leak, A-10 cap, BSN leading-zero parity, and partial-name match.
+ */
+
+let nextPatientSeq = 0;
+function patient(overrides: Partial<SearchablePatient> = {}): SearchablePatient {
+  nextPatientSeq += 1;
+  return {
+    _id: `patient_${nextPatientSeq}`,
+    achternaam: "Jansen",
+    voornaam: "Testvoornaam",
+    geboortedatum: "1990-01-01",
+    bsn: "123456782",
+    actief: true,
+    ...overrides,
+  };
+}
+
+describe("normalizeSearchCriteria (BSN parity, BR-11)", () => {
+  it("canonicalizes a BSN typed without its leading zero to nine digits", () => {
+    // "10000008" stored canonically is "010000008"; a search must use the same.
+    expect(normalizeSearchCriteria({ bsn: "10000008" }).bsn).toBe("010000008");
+  });
+
+  it("drops a blank or non-numeric BSN to undefined rather than erroring", () => {
+    expect(normalizeSearchCriteria({ bsn: "   " }).bsn).toBeUndefined();
+    expect(normalizeSearchCriteria({ bsn: "abc" }).bsn).toBeUndefined();
+  });
+
+  it("trims and lower-cases name fields for case-insensitive matching", () => {
+    const c = normalizeSearchCriteria({ achternaam: "  JaN  ", voornaam: "PiET" });
+    expect(c.achternaam).toBe("jan");
+    expect(c.voornaam).toBe("piet");
+  });
+
+  it("treats whitespace-only name fields as absent", () => {
+    expect(normalizeSearchCriteria({ achternaam: "   " }).achternaam).toBeUndefined();
+  });
+});
+
+describe("hasUsableCriteria (BR-4)", () => {
+  it("is false when nothing usable is supplied", () => {
+    expect(hasUsableCriteria(normalizeSearchCriteria({}))).toBe(false);
+    expect(hasUsableCriteria(normalizeSearchCriteria({ achternaam: "  ", bsn: "" }))).toBe(false);
+  });
+
+  it("is true when any usable criterion is present", () => {
+    expect(hasUsableCriteria(normalizeSearchCriteria({ achternaam: "Jan" }))).toBe(true);
+    expect(hasUsableCriteria(normalizeSearchCriteria({ geboortedatum: "1990-01-01" }))).toBe(true);
+  });
+});
+
+describe("matchesCriteria — partial name / exact BSN+dob", () => {
+  it("matches a case-insensitive achternaam PREFIX (FR-4 partial last name)", () => {
+    const c = normalizeSearchCriteria({ achternaam: "jan" });
+    expect(matchesCriteria(patient({ achternaam: "Jansen" }), c)).toBe(true);
+    expect(matchesCriteria(patient({ achternaam: "Janssens" }), c)).toBe(true);
+    expect(matchesCriteria(patient({ achternaam: "Pietersen" }), c)).toBe(false);
+  });
+
+  it("matches a BSN only on an exact (canonical) value", () => {
+    const c = normalizeSearchCriteria({ bsn: "123456782" });
+    expect(matchesCriteria(patient({ bsn: "123456782" }), c)).toBe(true);
+    expect(matchesCriteria(patient({ bsn: "111222333" }), c)).toBe(false);
+  });
+
+  it("matches geboortedatum exactly", () => {
+    const c = normalizeSearchCriteria({ geboortedatum: "1990-01-01" });
+    expect(matchesCriteria(patient({ geboortedatum: "1990-01-01" }), c)).toBe(true);
+    expect(matchesCriteria(patient({ geboortedatum: "1991-01-01" }), c)).toBe(false);
+  });
+});
+
+describe("resolvePatientSearch — BR-4 empty", () => {
+  it("returns [] for empty criteria WITHOUT inspecting any candidate (never list-all)", () => {
+    // Even if candidates are present, no usable criteria → zero results.
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({}),
+      candidates: [patient(), patient(), patient()],
+      includeInactive: false,
+    });
+    expect(results).toEqual([]);
+  });
+});
+
+describe("resolvePatientSearch — partial-name list (AC: 'Jan' → all matches)", () => {
+  it("returns every active patient whose achternaam starts with the term, projected to result shape", () => {
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ achternaam: "Jan" }),
+      candidates: [
+        patient({ achternaam: "Jansen", voornaam: "A" }),
+        patient({ achternaam: "Janssen", voornaam: "B" }),
+        patient({ achternaam: "Jansma", voornaam: "C" }),
+        patient({ achternaam: "Pietersen", voornaam: "D" }),
+      ],
+      includeInactive: false,
+    });
+    expect(results).toHaveLength(3);
+    // Each result carries exactly the display columns + id, and NO bsn (BR-11).
+    for (const r of results) {
+      expect(r).toHaveProperty("patientId");
+      expect(r).toHaveProperty("achternaam");
+      expect(r).toHaveProperty("voornaam");
+      expect(r).toHaveProperty("geboortedatum");
+      expect(r).not.toHaveProperty("bsn");
+    }
+  });
+});
+
+describe("resolvePatientSearch — EH-1 active-only / no inactive leak", () => {
+  it("returns zero results for a BSN that matches only a DEACTIVATED patient", () => {
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ bsn: "987654321" }),
+      candidates: [patient({ bsn: "987654321", actief: false })],
+      includeInactive: false,
+    });
+    expect(results).toEqual([]);
+  });
+
+  it("returns the same empty shape as a genuinely non-existent BSN (no leak)", () => {
+    const deactivatedHit = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ bsn: "987654321" }),
+      candidates: [patient({ bsn: "987654321", actief: false })],
+      includeInactive: false,
+    });
+    const noSuchBsn = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ bsn: "987654321" }),
+      candidates: [],
+      includeInactive: false,
+    });
+    expect(deactivatedHit).toEqual(noSuchBsn);
+  });
+
+  it("includes deactivated patients only when includeInactive is explicitly set", () => {
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ bsn: "987654321" }),
+      candidates: [patient({ bsn: "987654321", actief: false })],
+      includeInactive: true,
+    });
+    expect(results).toHaveLength(1);
+  });
+});
+
+describe("resolvePatientSearch — A-10 cap", () => {
+  it("returns at most SEARCH_RESULT_LIMIT (50) results even with more matches", () => {
+    const candidates = Array.from({ length: 80 }, () => patient({ achternaam: "De Vries" }));
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ achternaam: "De" }),
+      candidates,
+      includeInactive: false,
+    });
+    expect(results).toHaveLength(SEARCH_RESULT_LIMIT);
+  });
+});
+
+describe("resolvePatientSearch — BSN leading-zero parity end-to-end", () => {
+  it("finds a patient stored with a leading-zero BSN when searched without it", () => {
+    // Stored canonical "010000008"; user types "10000008".
+    const results = resolvePatientSearch({
+      criteria: normalizeSearchCriteria({ bsn: "10000008" }),
+      candidates: [patient({ bsn: "010000008" })],
+      includeInactive: false,
+    });
+    expect(results).toHaveLength(1);
+  });
+});
