@@ -85,15 +85,20 @@ export function PatientProfile({ patientId }: { patientId: string }) {
   const getPatientForView = useMutation(getPatientForViewRef);
   const [state, setState] = useState<LoadState>({ status: "loading" });
 
-  // Fire the audited view exactly once per page load. A ref guard prevents the
-  // double-invocation React Strict Mode triggers in development, so we never log
-  // two `view` audit entries for a single profile open (AC-9).
-  const firedRef = useRef(false);
+  // Fire the audited view exactly once PER patient. The ref records which
+  // patientId we have already fired for, which (a) suppresses the double
+  // invocation React Strict Mode triggers in development, so we never log two
+  // `view` audit entries for one profile open (AC-9), and (b) still re-fires
+  // when patientId changes — e.g. client-side navigation between two profiles
+  // reuses this component instance, and we must load+audit the NEW patient
+  // rather than keep showing the previous one.
+  const firedForRef = useRef<string | null>(null);
   useEffect(() => {
-    if (firedRef.current) {
+    if (firedForRef.current === patientId) {
       return;
     }
-    firedRef.current = true;
+    firedForRef.current = patientId;
+    setState({ status: "loading" });
     void (async () => {
       try {
         const data = await getPatientForView({ patientId });

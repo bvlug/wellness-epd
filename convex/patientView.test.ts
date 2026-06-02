@@ -97,7 +97,7 @@ describe("selectRecentBehandelingen (FR-3)", () => {
     ]);
   });
 
-  it("breaks same-date ties deterministically by id (creation order)", () => {
+  it("breaks same-date ties deterministically by id (stable order)", () => {
     const result = selectRecentBehandelingen([
       behandeling("b_a", "2026-06-01"),
       behandeling("b_c", "2026-06-01"),

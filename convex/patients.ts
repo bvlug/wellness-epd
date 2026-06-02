@@ -609,8 +609,11 @@ export function selectUpcomingAfspraken(
 /**
  * Pure selection of the "last five behandelingen" summary: most recent first by
  * `treatmentDate` (ISO `YYYY-MM-DD`, lexically sortable), capped at
- * {@link RECENT_BEHANDELINGEN_LIMIT}. Ties broken by a stable id fallback so the
- * result is deterministic.
+ * {@link RECENT_BEHANDELINGEN_LIMIT}. Same-date ties are broken by the opaque
+ * `_id` so the order is STABLE/deterministic (note: a Convex `_id` is not
+ * chronologically ordered, so this is a stable tiebreak, not true creation
+ * order — `treatmentDate` granularity is a day, which is acceptable for the
+ * Sprint-1 summary).
  */
 export function selectRecentBehandelingen(
   behandelingen: readonly BehandelingSummary[],
