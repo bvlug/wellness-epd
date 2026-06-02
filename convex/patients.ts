@@ -1,4 +1,4 @@
-import { mutationGeneric } from "convex/server";
+import { mutationGeneric, queryGeneric } from "convex/server";
 import { ConvexError, v } from "convex/values";
 import { normalizeBsn } from "../lib/bsn";
 import {
@@ -7,7 +7,7 @@ import {
   validatePatientInput,
 } from "../lib/patient-validation";
 import { type AuditMutationContext, logAudit } from "./audit";
-import { type AuthContext, type Role, assertHasRole, getRoles } from "./auth";
+import { type AuthContext, type Role, assertHasRole, getRoles, requireIdentity } from "./auth";
 import { GESLACHT_VALUES } from "./schema";
 
 /**
@@ -246,5 +246,294 @@ export const createPatient = mutationGeneric({
     });
 
     return { patientId };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* Patient search (Story P-2-S1; FR-4, BR-4, BR-11, EH-1, A-10, AC-9).        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Patient search (Story P-2-S1). This is the AUTHORITATIVE, server-side read
+ * path: any authenticated staff member may search ({@link requireIdentity}),
+ * and every search rule is enforced here, never trusted to the form. The rules,
+ * in order:
+ *
+ *   - **BR-4 — no blanket list.** If the caller supplies no usable criteria, the
+ *     query returns `[]` immediately and never reads the patient table. The
+ *     search screen is not a way to enumerate every patient.
+ *   - **EH-1 — active-only, no inactive leak.** Deactivated patients
+ *     (`actief = false`) are excluded unless an explicit `includeInactive` flag
+ *     is passed. A BSN that matches only a deactivated record yields ZERO
+ *     results, and the response shape is identical to "no match at all" — the
+ *     caller cannot tell that the BSN exists on an inactive record.
+ *   - **A-10 — capped.** At most {@link SEARCH_RESULT_LIMIT} results are returned.
+ *   - **BSN parity.** A BSN search key is canonicalized with the SAME
+ *     {@link normalizeBsn} used when the BSN is stored (#19), so a value typed
+ *     without its leading zero still matches the zero-padded stored value via the
+ *     `by_bsn` index.
+ *   - **BR-11 — BSN never logged.** No code path here `console.*`-logs or throws
+ *     the BSN value; results carry no BSN at all.
+ *
+ * Each result is intentionally minimal — `achternaam`, `voornaam`,
+ * `geboortedatum`, and the patient id — exactly the columns the results list
+ * shows and enough to link through to the profile. The BSN is deliberately NOT
+ * returned. The AC-9 "click-through writes a view audit" requirement is NOT
+ * satisfied here: it lives on the patient-profile view path owned by #20; this
+ * query only locates patients and the UI links to that path.
+ */
+
+/** A-10: the maximum number of search results returned in one response. */
+export const SEARCH_RESULT_LIMIT = 50;
+
+/**
+ * Internal scan ceiling. When a name/dob-only search has to range-scan the
+ * `by_achternaam` index (no exact BSN to point-look-up), we read at most this
+ * many candidate rows before filtering down to {@link SEARCH_RESULT_LIMIT}. It
+ * is a POC-scale guard against an unbounded table scan; with more data this
+ * would become a dedicated Convex search index.
+ */
+const SEARCH_SCAN_LIMIT = 500;
+
+/** Raw, loosely-typed search criteria as they arrive from the form. */
+export interface PatientSearchCriteria {
+  achternaam?: string;
+  voornaam?: string;
+  geboortedatum?: string;
+  bsn?: string;
+}
+
+/**
+ * Criteria after trimming/canonicalization. `bsn` is the {@link normalizeBsn}
+ * canonical form (or `undefined` when blank/non-numeric); the name fields are
+ * trimmed and lower-cased for case-insensitive matching; `geboortedatum` is
+ * trimmed. A field is present only when it carries a usable value, so
+ * {@link hasUsableCriteria} can decide BR-4 from this shape alone.
+ */
+export interface NormalizedSearchCriteria {
+  achternaam?: string;
+  voornaam?: string;
+  geboortedatum?: string;
+  bsn?: string;
+}
+
+/** The PII-minimal shape returned per match (no BSN; BR-11). */
+export interface PatientSearchResult {
+  patientId: string;
+  achternaam: string;
+  voornaam: string;
+  geboortedatum: string;
+}
+
+/** The minimal patient fields the search core needs to match and project. */
+export interface SearchablePatient {
+  _id: string;
+  achternaam: string;
+  voornaam: string;
+  geboortedatum: string;
+  bsn: string;
+  actief: boolean;
+}
+
+/** Trim a loose string and drop it when empty. */
+function trimmedOrUndefined(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+/**
+ * Normalize raw criteria: trim/lower-case the name fields, trim geboortedatum,
+ * and canonicalize the BSN through {@link normalizeBsn} so the search key and
+ * the stored value share one canonical form (leading-zero parity). A BSN that
+ * is blank or not all-digits becomes `undefined` (no BSN criterion), never an
+ * error that could echo the value (BR-11).
+ */
+export function normalizeSearchCriteria(criteria: PatientSearchCriteria): NormalizedSearchCriteria {
+  const achternaam = trimmedOrUndefined(criteria.achternaam)?.toLowerCase();
+  const voornaam = trimmedOrUndefined(criteria.voornaam)?.toLowerCase();
+  const geboortedatum = trimmedOrUndefined(criteria.geboortedatum);
+  const rawBsn = trimmedOrUndefined(criteria.bsn);
+  const bsn = rawBsn === undefined ? undefined : (normalizeBsn(rawBsn) ?? undefined);
+  return { achternaam, voornaam, geboortedatum, bsn };
+}
+
+/**
+ * BR-4: whether the caller supplied at least one usable criterion. When this is
+ * false the query must return `[]` and never read the patient table.
+ */
+export function hasUsableCriteria(criteria: NormalizedSearchCriteria): boolean {
+  return (
+    criteria.achternaam !== undefined ||
+    criteria.voornaam !== undefined ||
+    criteria.geboortedatum !== undefined ||
+    criteria.bsn !== undefined
+  );
+}
+
+/**
+ * Pure predicate: does a patient match ALL supplied criteria? Name fields match
+ * as case-insensitive PREFIXES (partial achternaam/voornaam), BSN and
+ * geboortedatum match EXACTLY. Active/inactive filtering is handled separately
+ * by the caller (so EH-1 stays an explicit, visible step), not here.
+ */
+export function matchesCriteria(
+  patient: SearchablePatient,
+  criteria: NormalizedSearchCriteria,
+): boolean {
+  if (criteria.bsn !== undefined && patient.bsn !== criteria.bsn) {
+    return false;
+  }
+  if (
+    criteria.achternaam !== undefined &&
+    !patient.achternaam.toLowerCase().startsWith(criteria.achternaam)
+  ) {
+    return false;
+  }
+  if (
+    criteria.voornaam !== undefined &&
+    !patient.voornaam.toLowerCase().startsWith(criteria.voornaam)
+  ) {
+    return false;
+  }
+  if (criteria.geboortedatum !== undefined && patient.geboortedatum !== criteria.geboortedatum) {
+    return false;
+  }
+  return true;
+}
+
+/** Project a matched patient to the PII-minimal result shape (no BSN; BR-11). */
+function toResult(patient: SearchablePatient): PatientSearchResult {
+  return {
+    patientId: patient._id,
+    achternaam: patient.achternaam,
+    voornaam: patient.voornaam,
+    geboortedatum: patient.geboortedatum,
+  };
+}
+
+/**
+ * Pure search core, decoupled from Convex so every rule is unit-testable
+ * offline. Given already-normalized criteria and a fetched candidate list,
+ * applies: BR-4 (empty → `[]`), EH-1 (drop `actief === false` unless
+ * `includeInactive`), the criteria predicate, and the A-10 cap.
+ *
+ * The Convex handler is responsible only for choosing WHICH candidates to fetch
+ * (a `by_bsn` point lookup vs. a bounded `by_achternaam`/table scan) and for not
+ * fetching at all when {@link hasUsableCriteria} is false — but this function
+ * re-checks emptiness too, so the rule holds regardless of caller.
+ */
+export function resolvePatientSearch(args: {
+  criteria: NormalizedSearchCriteria;
+  candidates: readonly SearchablePatient[];
+  includeInactive: boolean;
+  limit?: number;
+}): PatientSearchResult[] {
+  if (!hasUsableCriteria(args.criteria)) {
+    return [];
+  }
+  const limit = args.limit ?? SEARCH_RESULT_LIMIT;
+  const results: PatientSearchResult[] = [];
+  for (const patient of args.candidates) {
+    if (!args.includeInactive && !patient.actief) {
+      continue;
+    }
+    if (!matchesCriteria(patient, args.criteria)) {
+      continue;
+    }
+    results.push(toResult(patient));
+    if (results.length >= limit) {
+      break;
+    }
+  }
+  return results;
+}
+
+/**
+ * The Convex `db` slice the search query needs: a `by_bsn` point lookup and a
+ * `by_achternaam` range scan over the patient table. Declared narrowly (like
+ * the create mutation's context) so the handler typechecks before codegen and
+ * stays unit-test-friendly.
+ */
+interface PatientQueryContext extends AuthContext {
+  db: {
+    query: (table: "patient") => {
+      withIndex: (
+        index: "by_bsn" | "by_achternaam",
+        range: (q: {
+          eq: (field: "bsn", value: string) => unknown;
+        }) => unknown,
+      ) => { take: (n: number) => Promise<SearchablePatient[]> };
+    };
+  };
+}
+
+/**
+ * Authoritative patient-search query (FR-4). Authorizes any authenticated staff
+ * member, normalizes the criteria, and — only if a usable criterion is present —
+ * fetches a bounded candidate set and runs it through {@link resolvePatientSearch}.
+ *
+ * Fetch strategy:
+ *   - **BSN given:** a `by_bsn` point lookup on the canonical key — at most a
+ *     handful of rows, then the active-only/EH-1 filter drops a deactivated hit
+ *     so it returns zero results indistinguishably from "no such BSN".
+ *   - **No BSN:** a bounded `by_achternaam` scan (up to {@link SEARCH_SCAN_LIMIT}
+ *     rows) feeds the in-memory prefix/exact filter. Bounded so the query can
+ *     never turn into an unbounded table scan (a real search index would replace
+ *     this past POC scale).
+ *
+ * BR-11: the BSN is used only as an opaque lookup key; it is never logged and is
+ * absent from every result.
+ */
+export const searchPatients = queryGeneric({
+  args: {
+    achternaam: v.optional(v.string()),
+    voornaam: v.optional(v.string()),
+    geboortedatum: v.optional(v.string()),
+    bsn: v.optional(v.string()),
+    includeInactive: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    // Any authenticated staff member may search (FR-4). Fails closed (EH-7).
+    await requireIdentity(ctx as AuthContext);
+
+    const criteria = normalizeSearchCriteria({
+      achternaam: args.achternaam,
+      voornaam: args.voornaam,
+      geboortedatum: args.geboortedatum,
+      bsn: args.bsn,
+    });
+
+    // BR-4: no usable criteria → return nothing without touching the table.
+    if (!hasUsableCriteria(criteria)) {
+      return [];
+    }
+
+    const queryCtx = ctx as unknown as PatientQueryContext;
+
+    let candidates: SearchablePatient[];
+    if (criteria.bsn !== undefined) {
+      // Exact-BSN point lookup on the canonical key (leading-zero parity).
+      const bsnKey = criteria.bsn;
+      candidates = await queryCtx.db
+        .query("patient")
+        .withIndex("by_bsn", (q) => q.eq("bsn", bsnKey))
+        .take(SEARCH_RESULT_LIMIT);
+    } else {
+      // Bounded scan ordered by achternaam; the in-memory predicate applies the
+      // case-insensitive prefix / exact-dob match.
+      candidates = await queryCtx.db
+        .query("patient")
+        .withIndex("by_achternaam", () => undefined)
+        .take(SEARCH_SCAN_LIMIT);
+    }
+
+    return resolvePatientSearch({
+      criteria,
+      candidates,
+      includeInactive: args.includeInactive ?? false,
+    });
   },
 });
