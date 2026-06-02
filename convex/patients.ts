@@ -1,5 +1,5 @@
 import { mutationGeneric, queryGeneric } from "convex/server";
-import { ConvexError, v } from "convex/values";
+import { ConvexError, type GenericId, v } from "convex/values";
 import { normalizeBsn } from "../lib/bsn";
 import {
   type PatientInput,
@@ -535,5 +535,181 @@ export const searchPatients = queryGeneric({
       candidates,
       includeInactive: args.includeInactive ?? false,
     });
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/* View patient profile (Story P-1-S2; FR-3, AC-1, AC-9, BR-3, BR-11)         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The patient profile view path.
+ *
+ * **Why this is a `mutation`, not a `query`.** AC-9 requires that opening a
+ * patient profile writes a `view` audit entry, and AC-7 (#17) documents that a
+ * Convex **query is read-only** — it cannot insert an audit entry. A profile
+ * view therefore both READS the patient and WRITES an audit row, which is only
+ * possible from a `mutation` (or `action`). We model it as a single `mutation`,
+ * {@link getPatientForView}, so the read and the audit write happen atomically
+ * in one Convex transaction: if the audit insert fails, the whole call rolls
+ * back and the caller gets no patient data either (you cannot view without being
+ * audited). The frontend fires this once when the profile page loads.
+ *
+ * **Authorization (FR-3 / AC-1).** Any authenticated staff member (behandelaar,
+ * balie, or admin) may view a profile, so this path authorizes via
+ * {@link requireIdentity} only — no role gate. Crucially, {@link requireIdentity}
+ * runs FIRST, before any `db` read, so an unauthenticated caller throws
+ * {@link import("./auth").UnauthenticatedError} and receives NO patient data
+ * (AC-1). Route middleware redirecting the browser to sign-in is convenience;
+ * this server check is the real boundary.
+ *
+ * **BSN / AVG (BR-3 / BR-11).** The full patient record — including the full BSN
+ * — is returned to the authorized staff member by design (BR-3). The audit
+ * entry remains PII-free: {@link logAudit} accepts only enums plus the opaque
+ * patient id, so no name/BSN is ever written to the audit trail (BR-11).
+ */
+
+/** A persisted afspraak row, as read for the upcoming-afspraken summary. */
+export interface AfspraakSummary {
+  _id: GenericId<"afspraak">;
+  startDatetime: number;
+  durationMinutes: number;
+  status: string;
+  behandelaarId: string;
+  behandelsoortId?: GenericId<"behandelsoort">;
+}
+
+/** A persisted behandeling row, as read for the recent-behandelingen summary. */
+export interface BehandelingSummary {
+  _id: GenericId<"behandeling">;
+  treatmentDate: string;
+  behandelaarId: string;
+  behandelsoortId: GenericId<"behandelsoort">;
+  status: string;
+}
+
+/** How many recent behandelingen the profile summary shows (FR-3). */
+export const RECENT_BEHANDELINGEN_LIMIT = 5;
+
+/**
+ * Pure selection of the "upcoming afspraken" summary: keep only afspraken that
+ * start at/after `now` and are not cancelled, sorted soonest-first. Extracted
+ * from the mutation so the date/sort logic is unit-testable without a Convex
+ * runtime. `now` is injectable for deterministic tests.
+ */
+export function selectUpcomingAfspraken(
+  afspraken: readonly AfspraakSummary[],
+  now: number,
+): AfspraakSummary[] {
+  return afspraken
+    .filter((a) => a.startDatetime >= now && a.status !== "geannuleerd")
+    .sort((a, b) => a.startDatetime - b.startDatetime);
+}
+
+/**
+ * Pure selection of the "last five behandelingen" summary: most recent first by
+ * `treatmentDate` (ISO `YYYY-MM-DD`, lexically sortable), capped at
+ * {@link RECENT_BEHANDELINGEN_LIMIT}. Ties broken by a stable id fallback so the
+ * result is deterministic.
+ */
+export function selectRecentBehandelingen(
+  behandelingen: readonly BehandelingSummary[],
+): BehandelingSummary[] {
+  return [...behandelingen]
+    .sort((a, b) => {
+      if (a.treatmentDate !== b.treatmentDate) {
+        return a.treatmentDate < b.treatmentDate ? 1 : -1;
+      }
+      return a._id < b._id ? 1 : -1;
+    })
+    .slice(0, RECENT_BEHANDELINGEN_LIMIT);
+}
+
+/** The full profile payload returned to an authorized viewer. */
+export interface PatientProfileView {
+  patient: {
+    _id: GenericId<"patient">;
+    _creationTime: number;
+    voornaam: string;
+    tussenvoegsel?: string;
+    achternaam: string;
+    geboortedatum: string;
+    geslacht: (typeof GESLACHT_VALUES)[number];
+    bsn: string;
+    email?: string;
+    telefoonnummer?: string;
+    adres?: { straat: string; huisnummer: string; postcode: string; stad: string };
+    notities?: string;
+    actief: boolean;
+  };
+  upcomingAfspraken: AfspraakSummary[];
+  recentBehandelingen: BehandelingSummary[];
+}
+
+/**
+ * The Convex `db` slice the view path needs: a `get` by patient id plus indexed
+ * reads of the patient's afspraken/behandelingen. Declared narrowly (no
+ * mutating handle beyond what {@link logAudit} brings) so the surface stays
+ * read-then-audit only.
+ */
+interface PatientViewContext extends AuthContext, AuditMutationContext {
+  db: AuditMutationContext["db"] & {
+    get: (id: GenericId<"patient">) => Promise<PatientProfileView["patient"] | null>;
+    query: (table: "afspraak" | "behandeling") => {
+      withIndex: (
+        index: "by_patient",
+        range: (q: { eq: (field: "patientId", value: string) => unknown }) => unknown,
+      ) => { collect: () => Promise<Array<Record<string, unknown>>> };
+    };
+  };
+}
+
+/**
+ * Read a patient profile and audit the view (Story P-1-S2). See the block
+ * comment above for why this is a mutation. The afspraken/behandelingen
+ * summaries read the real tables but degrade to empty arrays when those domains
+ * have no data yet — a stub/empty state is acceptable in Sprint 1 (#20 Notes),
+ * so this never blocks on the Afspraken/Behandelingen epics.
+ */
+export const getPatientForView = mutationGeneric({
+  args: { patientId: v.id("patient") },
+  handler: async (ctx, args) => {
+    // AC-1: authorize BEFORE any read. Any authenticated staff member may view
+    // (FR-3) — identity is sufficient, no role gate. An unauthenticated caller
+    // throws here and receives no patient data.
+    await requireIdentity(ctx as AuthContext);
+
+    const viewCtx = ctx as unknown as PatientViewContext;
+
+    const patient = await viewCtx.db.get(args.patientId);
+    if (patient === null) {
+      throw new ConvexError({ code: "patient_not_found" });
+    }
+
+    const afspraakRows = await viewCtx.db
+      .query("afspraak")
+      .withIndex("by_patient", (q) => q.eq("patientId", args.patientId))
+      .collect();
+    const behandelingRows = await viewCtx.db
+      .query("behandeling")
+      .withIndex("by_patient", (q) => q.eq("patientId", args.patientId))
+      .collect();
+
+    const upcomingAfspraken = selectUpcomingAfspraken(
+      afspraakRows as unknown as AfspraakSummary[],
+      Date.now(),
+    );
+    const recentBehandelingen = selectRecentBehandelingen(
+      behandelingRows as unknown as BehandelingSummary[],
+    );
+
+    // AC-9: PII-free `view` audit entry, in the same transaction as the read.
+    await logAudit(viewCtx, {
+      action: "view",
+      resourceType: "patient",
+      resourceId: args.patientId,
+    });
+
+    return { patient, upcomingAfspraken, recentBehandelingen } satisfies PatientProfileView;
   },
 });
