@@ -41,6 +41,14 @@ can verify Clerk tokens:
 npx convex env set CLERK_JWT_ISSUER_DOMAIN https://your-app.clerk.accounts.dev
 ```
 
+The admin user/role screen (`app/admin/users`) is backed by a Convex action that calls the
+Clerk Management API server-side, so `CLERK_SECRET_KEY` must **also** be set on the Convex
+deployment (it is read from the Convex env, never shipped to the browser):
+
+```bash
+npx convex env set CLERK_SECRET_KEY sk_...
+```
+
 ## Local development
 
 Run both processes side by side:
