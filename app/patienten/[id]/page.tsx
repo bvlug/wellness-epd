@@ -1,15 +1,15 @@
+import { PatientProfile } from "@/components/PatientProfile";
+
 /**
- * Patiëntprofiel — PLACEHOLDER (Story P-1-S1 redirect target).
+ * Patiëntprofiel — read-only patient profile view (Story P-1-S2; FR-3, AC-1,
+ * AC-9). Protected by the Clerk middleware, so reaching it implies an
+ * authenticated session; the Convex `getPatientForView` path additionally
+ * authorizes the identity server-side and writes the `view` audit entry (AC-9).
  *
- * The successful-creation flow (P-1-S1) redirects here, but the real profile
- * view is Story #20 (P-1-S2, "View patient profile"), which is not built yet.
- * This page exists only so the create redirect has a stable, route-correct
- * destination today; #20 will replace this body with the authorized Convex
- * `getPatient` query and the full profile UI.
- *
- * DELIBERATELY shows NO patient data: it does not (yet) fetch the record, so no
- * patient-identifying data is rendered here (AVG/GDPR). It only echoes the
- * opaque Convex id from the route — a system identifier, not PII.
+ * The actual data fetch + audit-on-view happens in the {@link PatientProfile}
+ * client component, because the view path is a Convex mutation (a query is
+ * read-only and cannot write the audit entry — AC-7). This page only resolves
+ * the route id and hands it down.
  *
  * In Next.js 15 the App Router passes route params as a Promise.
  */
@@ -23,11 +23,7 @@ export default async function PatientProfilePage({
   return (
     <main style={{ padding: "2rem", fontFamily: "system-ui, sans-serif" }}>
       <h1 style={{ marginTop: 0 }}>Patiëntprofiel</h1>
-      <p>
-        De patiënt is aangemaakt. Het volledige profiel wordt in een volgende story (#20)
-        toegevoegd.
-      </p>
-      <p style={{ color: "#555", fontSize: "0.875rem" }}>Record-id: {id}</p>
+      <PatientProfile patientId={id} />
     </main>
   );
 }

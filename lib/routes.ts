@@ -32,9 +32,15 @@ export const PATIENT_ROUTES = {
   /** The "New patient" form (Story P-1-S1). */
   new: "/patienten/nieuw",
   /**
-   * A patient's profile page (Story P-1-S2 / #20). Built here only as a minimal
-   * placeholder that the create flow can redirect to on success; #20 fleshes it
-   * out into the real profile view.
+   * A patient's profile page (Story P-1-S2 / #20). The create flow redirects
+   * here on success and #20 fleshes it out into the real read-only profile view.
    */
   profile: (patientId: string): string => `/patienten/${patientId}`,
+  /**
+   * A patient's full behandeling history (Story P-1-S2 "view full history"
+   * link). The dedicated history page belongs to a later Behandelingen story;
+   * this helper fixes the URL shape now so the profile link is stable and the
+   * eventual route can slot in without touching callers.
+   */
+  history: (patientId: string): string => `/patienten/${patientId}/behandelingen`,
 } as const;
